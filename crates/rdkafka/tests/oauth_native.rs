@@ -1,11 +1,127 @@
 //! Native OAuth installation preserves expiry validation and failure recovery.
 #![cfg(feature = "http")]
+#[path = "support/h2_server.rs"]
+mod server;
+
 use std::{
+    cell::Cell,
     collections::BTreeMap,
-    time::{SystemTime, UNIX_EPOCH},
+    rc::{Rc, Weak},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use rdkafka::{Conf, OAuthBearerToken, OAuthBearerTokenSetter, Producer, Result};
+use rdkafka::{
+    Conf, HttpTransport, OAuthBearerHttpClient, OAuthBearerToken, OAuthBearerTokenSetter, Producer,
+    Result, TlsSettings, oauth::OAuthBearerConfig,
+};
+
+#[test]
+fn integration_lifecycle_scenario_native_refresh_installs_http2_token_during_poll() -> Result<()> {
+    let mut server = server::Server::new(
+        br#"{"access_token":"native-http-token","expires_in":120,"scope":"kafka read","token_type":"Bearer","extensions":{"tenant":"fixture"}}"#,
+        true,
+    )
+    .expect("start HTTP/2 TLS token endpoint");
+    let tls = TlsSettings::new()
+        .with_native_roots(false)
+        .with_ca_pem(server.ca_pem.clone())
+        .with_server_name("fixture.test")
+        .with_client_identity(server.client_cert.clone(), server.client_key.clone());
+    let mut config = OAuthBearerConfig::new(server.url(), "native-client", "secret&value");
+    config.principal = "native-user".into();
+    config.scope = vec!["kafka".into()];
+    let mut http = OAuthBearerHttpClient::new(HttpTransport::new(tls)?, config);
+
+    struct NativeTarget {
+        handle: Weak<Producer>,
+        installations: Rc<Cell<usize>>,
+    }
+    impl OAuthBearerTokenSetter for NativeTarget {
+        fn oauthbearer_set_token(&mut self, token: &OAuthBearerToken) -> Result<()> {
+            assert_eq!(token.access_token, "native-http-token");
+            assert_eq!(token.principal, "native-user");
+            assert_eq!(token.scope, ["kafka", "read"]);
+            assert_eq!(
+                token.extensions.get("tenant").map(String::as_str),
+                Some("fixture")
+            );
+            let extensions = token
+                .extensions
+                .iter()
+                .flat_map(|(name, value)| [name.clone(), value.clone()])
+                .collect::<Vec<_>>();
+            self.handle
+                .upgrade()
+                .expect("polling producer is alive")
+                .oauthbearer_set_token(
+                    &token.access_token,
+                    token.expires_at_ms,
+                    &token.principal,
+                    &extensions,
+                )?;
+            self.installations.set(self.installations.get() + 1);
+            Ok(())
+        }
+        fn oauthbearer_set_token_failure(&mut self, reason: &str) -> Result<()> {
+            self.handle
+                .upgrade()
+                .expect("polling producer is alive")
+                .oauthbearer_set_token_failure(reason)?;
+            panic!("trusted HTTP/2 token refresh failed: {reason}")
+        }
+    }
+
+    let owner = std::thread::current().id();
+    let installations = Rc::new(Cell::new(0));
+    let callback_calls = Rc::new(Cell::new(0));
+    let callback_count = Rc::clone(&callback_calls);
+    let target = Rc::new(std::cell::RefCell::new(NativeTarget {
+        handle: Weak::new(),
+        installations: Rc::clone(&installations),
+    }));
+    let callback_target = Rc::clone(&target);
+    let mut conf = Conf::new();
+    conf.set("bootstrap.servers", "127.0.0.1:1")?
+        .set("security.protocol", "SASL_PLAINTEXT")?
+        .set("sasl.mechanisms", "OAUTHBEARER")?;
+    conf.oauthbearer_token_refresh_cb(move |_| {
+        assert_eq!(owner, std::thread::current().id());
+        callback_count.set(callback_count.get() + 1);
+        http.refresh(&mut *callback_target.borrow_mut())
+    });
+    let producer = Rc::new(Producer::new(&conf)?);
+    target.borrow_mut().handle = Rc::downgrade(&producer);
+    assert_eq!(callback_calls.get(), 0);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while installations.get() == 0 && Instant::now() < deadline {
+        producer.poll(20)?;
+    }
+    assert_eq!(
+        callback_calls.get(),
+        1,
+        "native refresh delivered during poll"
+    );
+    assert_eq!(
+        installations.get(),
+        1,
+        "native handle accepted fetched token"
+    );
+    let producer_lifetime = Rc::downgrade(&producer);
+    drop(producer);
+    assert!(
+        producer_lifetime.upgrade().is_none(),
+        "callback does not retain producer"
+    );
+    drop(conf);
+    let observed = server.finish().expect("join HTTP/2 TLS token endpoint");
+    assert!(observed.client_authenticated);
+    let body = String::from_utf8(observed.body).expect("form request is UTF-8");
+    assert!(body.contains("grant_type=client_credentials"));
+    assert!(body.contains("client_id=native-client"));
+    assert!(body.contains("client_secret=secret%26value"));
+    assert!(body.contains("scope=kafka"));
+    Ok(())
+}
 
 #[test]
 fn integration_lifecycle_scenario_native_oauth_token_target() -> Result<()> {
