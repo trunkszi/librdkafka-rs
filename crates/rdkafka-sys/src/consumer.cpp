@@ -40,7 +40,7 @@ rust::Vec<NativePartition> consumer_list(Client &c, bool assignment) {
   rust::Vec<NativePartition> out;
   for (int i = 0; i < list->cnt; ++i) {
     auto &p = list->elems[i];
-    out.push_back({rust::String(p.topic), p.partition, p.offset, p.err});
+    out.push_back(partition_from(p));
   }
   rd_kafka_topic_partition_list_destroy(list);
   return out;
@@ -48,7 +48,24 @@ rust::Vec<NativePartition> consumer_list(Client &c, bool assignment) {
 std::unique_ptr<Message> consume(Client &c, int32_t timeout) {
   return wrap(rd_kafka_consumer_poll(c.raw(), timeout), c.state);
 }
-int32_t consumer_close(Client &c) { return rd_kafka_consumer_close(c.raw()); }
+void consumer_close_begin(Client &c) {
+  if (c.close_queue || rd_kafka_consumer_closed(c.raw())) return;
+  c.close_queue.reset(rd_kafka_queue_new(c.raw()));
+  auto *error = rd_kafka_consumer_close_queue(c.raw(), c.close_queue.get());
+  if (error) {
+    std::string message = std::to_string(rd_kafka_error_code(error)) + ":" + rd_kafka_error_string(error);
+    rd_kafka_error_destroy(error);
+    c.close_queue.reset();
+    throw std::runtime_error(message);
+  }
+}
+bool consumer_close_poll(Client &c, int32_t timeout) {
+  if (c.close_queue) {
+    auto *message = rd_kafka_consume_queue(c.close_queue.get(), timeout);
+    if (message) rd_kafka_message_destroy(message);
+  }
+  return rd_kafka_consumer_closed(c.raw());
+}
 int32_t simple_start(Client &, const Topic &t, int32_t p, int64_t o) {
   return rd_kafka_consume_start(t.value, p, o) == 0 ? 0 : rd_kafka_last_error();
 }

@@ -1,5 +1,7 @@
 //! Native error identity and operation-specific failure flags.
 use std::fmt;
+#[path = "error_codes.rs"]
+mod error_codes;
 /// Lossless numeric identity for every native broker and client error code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ErrorCode(pub i32);
@@ -115,6 +117,9 @@ impl Error {
         )
     }
     pub(crate) fn native(code: i32, message: impl Into<String>) -> Self {
+        if code == -184 {
+            return Self::QueueFull;
+        }
         let flags = rdkafka_sys::ffi::error_flags(code);
         Self::Native {
             code: ErrorCode(code),
@@ -132,6 +137,9 @@ impl From<cxx::Exception> for Error {
             .split_once(':')
             .and_then(|(c, m)| c.parse::<i32>().ok().map(|n| (n, m)))
             .unwrap_or((-1, text));
+        if code == -184 {
+            return Self::QueueFull;
+        }
         if let Some(rest) = message.strip_prefix("flags=")
             && let Some((flags, message)) = rest.split_once(':')
             && let Ok(flags) = flags.parse::<u8>()

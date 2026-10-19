@@ -81,13 +81,26 @@ impl Conf {
     }
     pub fn consume_cb(&mut self, cb: impl FnMut(&crate::Message) + 'static) -> &mut Self {
         self.callbacks.borrow_mut().consume = Some(Box::new(cb));
+        ffi::conf_set_observers(
+            self.native.pin_mut(),
+            true,
+            self.callbacks.borrow().rebalance.is_some(),
+        );
         self
     }
+    /// Registers a caller-thread rebalance decision callback.
+    /// The callback must apply assignment or revocation explicitly; automatic
+    /// native assignment is used only when no callback was registered.
     pub fn rebalance_cb(
         &mut self,
         cb: impl FnMut(i32, &[crate::TopicPartition]) + 'static,
     ) -> &mut Self {
         self.callbacks.borrow_mut().rebalance = Some(Box::new(cb));
+        ffi::conf_set_observers(
+            self.native.pin_mut(),
+            self.callbacks.borrow().consume.is_some(),
+            true,
+        );
         self
     }
     pub fn offset_commit_cb(

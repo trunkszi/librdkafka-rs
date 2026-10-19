@@ -18,6 +18,8 @@ pub mod ffi {
         partition: i32,
         offset: i64,
         error: i32,
+        leader_epoch: i32,
+        metadata: Vec<u8>,
     }
     #[derive(Clone, Debug)]
     struct NativeEvent {
@@ -29,6 +31,22 @@ pub mod ffi {
         offset: i64,
         token: u64,
         partitions: Vec<NativePartition>,
+        status: i32,
+        latency_us: i64,
+        broker_name: String,
+        broker_id: i32,
+        throttle_ms: i32,
+        log_level: i32,
+        log_facility: String,
+        fatal: bool,
+        timestamp: i64,
+        key: Vec<u8>,
+        has_key: bool,
+        payload: Vec<u8>,
+        has_payload: bool,
+        headers: Vec<NativeHeader>,
+        assignment_lost: bool,
+        rebalance_protocol: String,
     }
     #[derive(Clone, Debug)]
     struct NativePartitionMetadata {
@@ -71,6 +89,7 @@ pub mod ffi {
         /// Returns the native diagnostic when configuration or the operation fails.
         fn conf_set(conf: Pin<&mut Conf>, key: &str, value: &str) -> Result<()>;
         fn conf_set_hooks(conf: Pin<&mut Conf>, hooks: Box<NativeHooks>);
+        fn conf_set_observers(conf: Pin<&mut Conf>, consume: bool, rebalance: bool);
         fn mock_bootstraps(client: &Client) -> String;
         /// # Errors
         /// Returns the native diagnostic when configuration or the operation fails.
@@ -103,6 +122,22 @@ pub mod ffi {
         fn produce(
             client: Pin<&mut Client>,
             topic: &str,
+            partition: i32,
+            key: &[u8],
+            has_key: bool,
+            payload: &[u8],
+            has_payload: bool,
+            headers: &[NativeHeader],
+            timestamp: i64,
+            token: u64,
+        ) -> i32;
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "Mirrors native record fields and nullability"
+        )]
+        fn produce_topic(
+            client: Pin<&mut Client>,
+            topic: &Topic,
             partition: i32,
             key: &[u8],
             has_key: bool,
@@ -145,7 +180,10 @@ pub mod ffi {
             assignment: bool,
         ) -> Result<Vec<NativePartition>>;
         fn consume(client: Pin<&mut Client>, timeout: i32) -> UniquePtr<Message>;
-        fn consumer_close(client: Pin<&mut Client>) -> i32;
+        /// # Errors
+        /// Returns native consumer close initialization errors.
+        fn consumer_close_begin(client: Pin<&mut Client>) -> Result<()>;
+        fn consumer_close_poll(client: Pin<&mut Client>, timeout: i32) -> bool;
         /// # Errors
         /// Returns the native diagnostic when configuration or the operation fails.
         fn topic_new(client: Pin<&mut Client>, name: &str, conf: &Conf)
@@ -238,3 +276,7 @@ fn hooks_open(hooks: &NativeHooks, path: &str, flags: i32, mode: i32) -> i32 {
             .unwrap_or(-1)
     })
 }
+
+pub mod admin;
+pub mod batch;
+pub mod transactions;
