@@ -37,6 +37,7 @@ fn core() -> Rc<Core> {
         callbacks: Rc::clone(&callbacks),
         rebalance_snapshot: RefCell::default(),
         pending_error: RefCell::default(),
+        pending_tls_error: RefCell::default(),
         partition_counts: RefCell::default(),
         pending_events: RefCell::default(),
     })
@@ -118,6 +119,10 @@ fn unit_scenario_tls_failure_preserves_remaining_callback_order() {
     );
     assert!(core.rebalance_snapshot.borrow().is_none());
     assert!(core.callbacks.borrow().oauth.is_some());
+    assert!(
+        matches!(core.take_pending_error(), Err(Error::Config(message)) if message == "token refresh failed")
+    );
+    assert!(core.take_pending_error().is_ok());
 }
 
 #[test]
@@ -139,14 +144,17 @@ fn unit_scenario_first_callback_error_survives_later_tls_without_dropping_events
             event(13, "TLS failure"),
             event(0, ""),
         ]);
+        assert!(matches!(result, Err(Error::Tls(message)) if message == "TLS failure"));
+        let retained = core.take_pending_error();
         match kind {
             7 => assert!(
-                matches!(result, Err(Error::Config(message)) if message == "refresh failed")
+                matches!(retained, Err(Error::Config(message)) if message == "refresh failed")
             ),
-            10 | 12 => assert!(matches!(result, Err(Error::Native { .. }))),
+            10 | 12 => assert!(matches!(retained, Err(Error::Native { .. }))),
             _ => unreachable!(),
         }
         assert_eq!(deliveries.get(), 2);
+        assert!(core.take_pending_error().is_ok());
     }
 }
 
@@ -504,7 +512,10 @@ fn unit_scenario_pending_error_survives_receive_observer_and_later_tls_unwind() 
         .is_err()
     );
     assert!(
-        matches!(core.poll(0), Err(Error::Config(message)) if message == "first pending failure")
+        matches!(core.take_pending_error(), Err(Error::Tls(message)) if message == "later TLS failure")
+    );
+    assert!(
+        matches!(core.dispatch(Vec::new()), Err(Error::Config(message)) if message == "first pending failure")
     );
     assert!(core.take_pending_error().is_ok());
 }
@@ -524,7 +535,35 @@ fn unit_scenario_first_oauth_failure_survives_later_tls_observer_panic() {
         .is_err()
     );
     assert!(
-        matches!(core.poll(0), Err(Error::Config(message)) if message == "first refresh failed")
+        matches!(core.take_pending_error(), Err(Error::Tls(message)) if message == "later TLS failure")
+    );
+    assert!(
+        matches!(core.dispatch(Vec::new()), Err(Error::Config(message)) if message == "first refresh failed")
     );
     assert!(core.take_pending_error().is_ok());
+}
+
+#[test]
+fn integration_scenario_successful_receive_defers_tls_before_retained_oauth_failure() -> Result<()>
+{
+    let mut conf = Conf::new();
+    conf.set("test.mock.num.brokers", "1")?;
+    let core = Core::new(&conf, 0)?;
+    core.callbacks.borrow_mut().oauth =
+        Some(Box::new(|_| Err(Error::Config("refresh failed".into()))));
+    core.pending_events
+        .borrow_mut()
+        .extend([event(7, "refresh"), event(13, "certificate rejected")]);
+    assert_eq!(
+        core.complete_received(Ok(vec![7, 11]), |batch| !batch.is_empty())?,
+        [7, 11]
+    );
+    assert!(
+        matches!(core.complete(Ok(())), Err(Error::Tls(message)) if message == "certificate rejected")
+    );
+    assert!(
+        matches!(core.complete(Ok(())), Err(Error::Config(message)) if message == "refresh failed")
+    );
+    core.take_pending_error()?;
+    Ok(())
 }

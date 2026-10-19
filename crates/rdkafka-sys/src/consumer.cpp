@@ -58,6 +58,7 @@ void consumer_close_begin(Client &c) {
   if (c.close_queue || rd_kafka_consumer_closed(c.raw())) return;
   c.close_queue.reset(rd_kafka_queue_new(c.raw()));
   if (!c.close_queue) throw std::bad_alloc();
+  abort_pending_rebalance(*c.state);
   auto *error = rd_kafka_consumer_close_queue(c.raw(), c.close_queue.get());
   if (error) {
     std::string message = std::to_string(rd_kafka_error_code(error)) + ":" + rd_kafka_error_string(error);
