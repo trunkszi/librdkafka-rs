@@ -122,15 +122,10 @@ impl Core {
         self.dispatch(events)
     }
     fn dispatch(&self, events: Vec<ffi::NativeEvent>) -> Result<usize> {
-        let mut failure = None;
         macro_rules! record {
             ($error:expr) => {{
                 let error = $error;
-                if failure.is_none()
-                    || (matches!(&error, Error::Tls(_)) && !matches!(&failure, Some(Error::Tls(_))))
-                {
-                    failure = Some(error);
-                }
+                self.pending_error.borrow_mut().get_or_insert(error);
             }};
         }
         macro_rules! invoke {
@@ -156,6 +151,7 @@ impl Core {
             }
             match e.kind {
                 13 => {
+                    record!(Error::Tls(e.message.clone()));
                     invoke!(
                         event,
                         &Event::Error {
@@ -164,7 +160,6 @@ impl Core {
                             is_fatal: true
                         }
                     );
-                    record!(Error::Tls(e.message));
                 }
                 0 => invoke!(delivery, &DeliveryReport::from_native(&e)),
                 1..=4 => invoke!(event, &Event::from_native(&e)),
@@ -212,11 +207,11 @@ impl Core {
                 _ => {}
             }
         }
-        failure.map_or(Ok(n), Err)
+        self.take_pending_error().map(|()| n)
     }
     /// Completes an operation after its native borrow has been released.
-    /// The caller retains its drive guard throughout callback dispatch. TLS
-    /// failures take priority; other callback failures follow operation errors.
+    /// The caller retains its drive guard throughout callback dispatch. The first
+    /// callback failure is retained; a retained TLS failure precedes operation errors.
     pub fn complete<T>(&self, outcome: Result<T>) -> Result<T> {
         let callbacks = self.drain(0);
         match callbacks {

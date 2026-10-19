@@ -20,11 +20,29 @@ fn tls_error(error: rustls::Error) -> io::Error {
 }
 
 fn wait(descriptors: &mut [libc::pollfd], timeout: i32) -> io::Result<()> {
-    loop {
+    wait_with(descriptors, timeout, |descriptors, timeout| {
         // SAFETY: poll receives the valid mutable slice and its exact length.
         let result =
             unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout) };
-        if result > 0 {
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result)
+        }
+    })
+}
+
+fn wait_with(
+    descriptors: &mut [libc::pollfd],
+    timeout: i32,
+    poll: impl FnOnce(&mut [libc::pollfd], i32) -> io::Result<i32>,
+) -> io::Result<()> {
+    match poll(descriptors, timeout) {
+        Ok(0) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "broker TLS handshake timed out",
+        )),
+        Ok(_) => {
             if descriptors
                 .iter()
                 .any(|fd| fd.revents & libc::POLLNVAL != 0)
@@ -34,18 +52,17 @@ fn wait(descriptors: &mut [libc::pollfd], timeout: i32) -> io::Result<()> {
                     "closed TLS descriptor",
                 ));
             }
-            return Ok(());
+            Ok(())
         }
-        if result == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "broker TLS handshake timed out",
-            ));
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+            // The caller must recheck its deadline and cancellation state.
+            // poll does not promise valid revents when interrupted.
+            for descriptor in descriptors {
+                descriptor.revents = 0;
+            }
+            Ok(())
         }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
+        Err(error) => Err(error),
     }
 }
 
