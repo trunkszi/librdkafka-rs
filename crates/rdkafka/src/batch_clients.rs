@@ -356,30 +356,31 @@ impl Consumer {
         let outcome =
             native::consume_records(self.core.native.borrow_mut().pin_mut(), maximum, timeout_ms)
                 .map_err(Error::from);
-        let mut received = self
-            .core
-            .complete_received(outcome, |batch| native::batch_count(batch) != 0)?;
-        let mut entries = Vec::with_capacity(native::batch_count(&received));
-        for index in 0..native::batch_count(&received) {
-            let message = native::batch_take(received.pin_mut(), index);
-            let mut headers = Headers::new();
-            for header in ffi::message_headers(&message) {
-                headers.add(
-                    header.name,
-                    header.has_value.then_some(header.value.as_slice()),
-                );
+        let outcome = outcome.map(|mut received| {
+            let mut entries = Vec::with_capacity(native::batch_count(&received));
+            for index in 0..native::batch_count(&received) {
+                let message = native::batch_take(received.pin_mut(), index);
+                let mut headers = Headers::new();
+                for header in ffi::message_headers(&message) {
+                    headers.add(
+                        header.name,
+                        header.has_value.then_some(header.value.as_slice()),
+                    );
+                }
+                entries.push(ReceivedEntry {
+                    topic: ffi::message_topic(&message),
+                    headers,
+                    native: message,
+                });
             }
-            entries.push(ReceivedEntry {
-                topic: ffi::message_topic(&message),
-                headers,
-                native: message,
-            });
-        }
-        let batch = ReceivedBatch {
-            entries,
-            _owner: Rc::clone(&self.core),
-        };
-        if self.core.callbacks.borrow().consume.is_some() {
+            ReceivedBatch {
+                entries,
+                _owner: Rc::clone(&self.core),
+            }
+        });
+        if let Ok(batch) = &outcome
+            && self.core.callbacks.borrow().consume.is_some()
+        {
             for record in batch.iter() {
                 // Error records remain available to the caller in the batch.
                 let Ok(record) = record else { continue };
@@ -399,7 +400,8 @@ impl Consumer {
                 });
             }
         }
-        Ok(batch)
+        self.core
+            .complete_received(outcome, |batch| !batch.is_empty())
     }
     /// Visits borrowed typed views from one native receive operation.
     /// # Errors

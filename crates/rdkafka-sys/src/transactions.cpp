@@ -20,10 +20,10 @@ static void checked(rd_kafka_error_t *error) {
   throw std::runtime_error(message);
 }
 std::unique_ptr<GroupMetadata> group_metadata(const Client &client) {
+  auto result = std::make_unique<GroupMetadata>();
   auto *metadata = rd_kafka_consumer_group_metadata(client.raw());
   if (!metadata)
     throw std::runtime_error("-172:consumer group metadata unavailable");
-  auto result = std::make_unique<GroupMetadata>();
   result->value = metadata;
   return result;
 }
@@ -41,6 +41,7 @@ using Partitions = std::unique_ptr<rd_kafka_topic_partition_list_t,
 static Partitions partition_list(rust::Slice<const NativePartition> source) {
   Partitions result(rd_kafka_topic_partition_list_new(source.size()),
                     rd_kafka_topic_partition_list_destroy);
+  if (!result) throw std::bad_alloc();
   for (const auto &p : source) {
     auto *target = rd_kafka_topic_partition_list_add(result.get(), std::string(p.topic).c_str(),
                                                     p.partition);
@@ -63,9 +64,10 @@ void consumer_incremental(Client &client,
                           bool assign, bool complete_rebalance) {
   rd_kafka_topic_partition_list_t *current = nullptr;
   auto code = rd_kafka_assignment(client.raw(), &current);
+  Partitions owner(current, rd_kafka_topic_partition_list_destroy);
   if (code)
     throw std::runtime_error(std::to_string(code) + ":" + rd_kafka_err2str(code));
-  Partitions owner(current, rd_kafka_topic_partition_list_destroy);
+  if (!current) throw std::runtime_error("native assignment unavailable");
   auto selected = partition_list(source);
   // Repeated assignment deltas do not add or remove a partition twice.
   for (int i = selected->cnt - 1; i >= 0; --i) {

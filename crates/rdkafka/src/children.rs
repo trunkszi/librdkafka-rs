@@ -72,8 +72,11 @@ impl Queue {
     }
     /// Forwards to a retained destination queue.
     /// # Errors
-    /// Returns an error if forwarding would create an ownership cycle.
+    /// Returns an error for another client or a forwarding ownership cycle.
     pub fn forward(&self, destination: Rc<Self>) -> Result<()> {
+        if !Rc::ptr_eq(&self.core, &destination.core) {
+            return Err(Error::Config("queue belongs to another client".into()));
+        }
         let mut next = Some(Rc::clone(&destination));
         while let Some(q) = next {
             if std::ptr::eq(self, Rc::as_ptr(&q)) {
@@ -97,23 +100,25 @@ impl Queue {
     /// Returns callback errors.
     pub fn poll(&self, timeout_ms: i32) -> Result<i32> {
         let _guard = self.core.begin_drive()?;
+        self.core.take_pending_error()?;
         let n = ffi::queue_poll(self.native.borrow_mut().pin_mut(), timeout_ms);
         self.core.complete(Ok(n))
     }
     /// Consumes one message.
     /// # Errors
-    /// Returns message or callback errors.
+    /// Returns message errors; callback failures after fetching a record are
+    /// deferred until the next poll or receive.
     pub fn consume(&self, timeout_ms: i32) -> Result<Option<Message>> {
         let _guard = self.core.begin_drive()?;
+        self.core.take_pending_error()?;
         let outcome = message(ffi::queue_consume(
             self.native.borrow_mut().pin_mut(),
             timeout_ms,
         ));
-        let m = self.core.complete(outcome)?;
-        if let Some(v) = &m {
+        if let Ok(Some(v)) = &outcome {
             self.core.observe(v);
         }
-        Ok(m)
+        self.core.complete_received(outcome, Option::is_some)
     }
     /// Enables native readiness notifications on an owned file descriptor.
     /// The descriptor owner must keep it open until notifications are disabled.

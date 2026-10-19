@@ -73,7 +73,7 @@ pub mod ffi {
     extern "Rust" {
         type NativeHooks;
         fn hooks_empty() -> Box<NativeHooks>;
-        fn hooks_clone(hooks: &NativeHooks) -> Box<NativeHooks>;
+        fn hooks_clone(hooks: &NativeHooks) -> Result<Box<NativeHooks>>;
         fn hooks_socket(hooks: &NativeHooks, domain: i32, kind: i32, protocol: i32) -> i32;
         fn hooks_open(hooks: &NativeHooks, path: &str, flags: i32, mode: i32) -> i32;
         fn hooks_tls_enabled(hooks: &NativeHooks) -> bool;
@@ -91,6 +91,7 @@ pub mod ffi {
         include!("rdkafka-sys/src/shim.h");
         include!("rdkafka-sys/src/tls_callbacks.h");
         fn tls_callback_registry_teardown_test(hooks: Box<NativeHooks>) -> bool;
+        fn tls_callback_peer_name_test(hooks: Box<NativeHooks>, name: &str) -> i32;
         type Conf;
         type Client;
         type Queue;
@@ -282,10 +283,13 @@ pub struct NativeHooks {
 fn hooks_empty() -> Box<NativeHooks> {
     Box::default()
 }
-fn hooks_clone(hooks: &NativeHooks) -> Box<NativeHooks> {
-    let mut copy = hooks.clone();
-    copy.tls = hooks.tls.as_ref().map(|tls| tls.fork());
-    Box::new(copy)
+fn hooks_clone(hooks: &NativeHooks) -> Result<Box<NativeHooks>, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut copy = hooks.clone();
+        copy.tls = hooks.tls.as_ref().map(|tls| tls.fork());
+        Box::new(copy)
+    }))
+    .map_err(|_| "TLS hook fork panicked".to_owned())
 }
 fn hooks_socket(hooks: &NativeHooks, domain: i32, kind: i32, protocol: i32) -> i32 {
     hooks.socket.as_ref().map_or(-2, |hook| {
@@ -328,7 +332,10 @@ fn hooks_tls_close(hooks: &NativeHooks, fd: i32) -> i32 {
     .unwrap_or(-1)
 }
 fn hooks_tls_errors(hooks: &NativeHooks) -> Vec<String> {
-    hooks.tls.as_ref().map_or_else(Vec::new, |tls| tls.errors())
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hooks.tls.as_ref().map_or_else(Vec::new, |tls| tls.errors())
+    }))
+    .unwrap_or_else(|_| vec!["TLS error hook panicked".to_owned()])
 }
 
 #[cfg(test)]
@@ -356,5 +363,77 @@ mod tls_registry_tests {
             ..Default::default()
         };
         assert!(ffi::tls_callback_registry_teardown_test(Box::new(hooks)));
+    }
+}
+
+#[cfg(test)]
+mod hook_panic_tests {
+    use super::*;
+
+    struct PanickingHooks(bool);
+    impl tls::BrokerTlsHooks for PanickingHooks {
+        fn fork(&self) -> Arc<dyn tls::BrokerTlsHooks> {
+            assert!(!self.0, "fork failed");
+            Arc::new(Self(false))
+        }
+        fn connect(&self, _: i32, _: &str, _: u16, _: &str) -> i32 {
+            libc::ECONNREFUSED
+        }
+        fn close(&self, _: i32) -> i32 {
+            -1
+        }
+        fn errors(&self) -> Vec<String> {
+            panic!("error callback failed")
+        }
+    }
+
+    #[test]
+    fn unit_scenario_tls_hook_panics_become_errors_at_bridge_boundary() {
+        let hooks = NativeHooks {
+            tls: Some(Arc::new(PanickingHooks(true))),
+            ..NativeHooks::default()
+        };
+        assert!(hooks_clone(&hooks).is_err());
+        assert_eq!(hooks_tls_errors(&hooks), ["TLS error hook panicked"]);
+        let mut conf = ffi::conf_new(false);
+        ffi::conf_set_hooks(conf.pin_mut(), Box::new(hooks));
+        let result = ffi::client_new(&conf, 0);
+        assert!(matches!(result, Err(error) if error.what().contains("TLS hook fork panicked")));
+    }
+}
+
+#[cfg(test)]
+mod peer_name_tests {
+    use super::*;
+    struct Peer(std::sync::Mutex<String>);
+    impl tls::BrokerTlsHooks for Peer {
+        fn fork(&self) -> Arc<dyn tls::BrokerTlsHooks> {
+            Arc::new(Self(std::sync::Mutex::default()))
+        }
+        fn connect(&self, _: i32, _: &str, _: u16, name: &str) -> i32 {
+            *self.0.lock().expect("peer lock") = name.to_owned();
+            libc::ECONNREFUSED
+        }
+        fn close(&self, _: i32) -> i32 {
+            -1
+        }
+        fn errors(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+    #[test]
+    fn integration_scenario_native_tls_preserves_full_ipv6_peer_name() {
+        for name in ["2001:db8::1", "[2001:db8::1]:9092", "broker.example:9092"] {
+            let peer = Arc::new(Peer(std::sync::Mutex::default()));
+            let hooks = NativeHooks {
+                tls: Some(peer.clone()),
+                ..NativeHooks::default()
+            };
+            assert_eq!(
+                ffi::tls_callback_peer_name_test(Box::new(hooks), name),
+                libc::ECONNREFUSED
+            );
+            assert_eq!(*peer.0.lock().expect("peer lock"), name);
+        }
     }
 }

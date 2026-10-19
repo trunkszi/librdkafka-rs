@@ -57,13 +57,15 @@ impl Producer {
         for p in offsets {
             core::text(&p.topic)?;
         }
-        ffi::transaction_offsets(
+        let _guard = self.core.begin_drive()?;
+        let result = ffi::transaction_offsets(
             self.core.native.borrow_mut().pin_mut(),
             &core::partitions(offsets),
             &metadata.native,
             timeout_ms,
-        )?;
-        Ok(())
+        )
+        .map_err(crate::Error::from);
+        self.core.complete(result)
     }
     /// Flushes deliveries and commits all transactional records and offsets.
     /// # Errors

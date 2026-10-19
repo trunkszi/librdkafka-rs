@@ -251,7 +251,8 @@ impl Consumer {
     }
     /// Consumes one message and invokes local observers.
     /// # Errors
-    /// Returns native message or callback errors.
+    /// Returns native message errors. When a record was fetched, callback failures
+    /// are deferred until the next poll or receive so that record is not discarded.
     pub fn consume(&self, timeout_ms: i32) -> Result<Option<Message>> {
         let _guard = self.core.begin_drive()?;
         self.core.take_pending_error()?;
@@ -259,29 +260,27 @@ impl Consumer {
             self.core.native.borrow_mut().pin_mut(),
             timeout_ms,
         ));
-        let m = self.core.complete_received(m, Option::is_some)?;
-        if let Some(v) = &m {
+        if let Ok(Some(v)) = &m {
             self.core.observe(v);
         }
-        Ok(m)
+        self.core.complete_received(m, Option::is_some)
     }
     /// Consumes a native-owned message with borrowed key and payload slices.
     /// Local consume observers, when configured, receive an owned projection.
     /// # Errors
-    /// Returns message or callback errors.
+    /// Returns message errors; callback failures after fetching a record are
+    /// deferred until the next poll or receive.
     pub fn consume_native(&self, timeout_ms: i32) -> Result<Option<ReceivedMessage>> {
         let _guard = self.core.begin_drive()?;
         self.core.take_pending_error()?;
         let native = ffi::consume(self.core.native.borrow_mut().pin_mut(), timeout_ms);
-        let message = self
-            .core
-            .complete_received(ReceivedMessage::wrap(native, &self.core), Option::is_some)?;
-        if let Some(m) = &message
+        let message = ReceivedMessage::wrap(native, &self.core);
+        if let Ok(Some(m)) = &message
             && self.core.callbacks.borrow().consume.is_some()
         {
             self.core.observe(&m.to_owned());
         }
-        Ok(message)
+        self.core.complete_received(message, Option::is_some)
     }
     /// Closes group membership synchronously.
     /// # Errors
@@ -452,7 +451,8 @@ impl SimpleConsumer {
     }
     /// Consumes an explicit partition.
     /// # Errors
-    /// Returns native message or callback errors.
+    /// Returns native message errors. When a record was fetched, callback failures
+    /// are deferred until the next poll or receive so that record is not discarded.
     pub fn consume(
         &self,
         topic: &Topic,
@@ -468,11 +468,10 @@ impl SimpleConsumer {
             partition,
             timeout_ms,
         ));
-        let m = self.core.complete_received(outcome, Option::is_some)?;
-        if let Some(v) = &m {
+        if let Ok(Some(v)) = &outcome {
             self.core.observe(v);
         }
-        Ok(m)
+        self.core.complete_received(outcome, Option::is_some)
     }
     fn check_topic(&self, topic: &Topic) -> Result<()> {
         if Rc::ptr_eq(&self.core, &topic.core) {

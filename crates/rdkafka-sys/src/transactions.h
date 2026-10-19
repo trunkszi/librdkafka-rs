@@ -3,7 +3,7 @@
 #include "rdkafka-sys/src/lib.rs.h"
 namespace kafka_bridge {
 struct GroupMetadata {
-  rd_kafka_consumer_group_metadata_t *value;
+  rd_kafka_consumer_group_metadata_t *value = nullptr;
   ~GroupMetadata();
 };
 std::unique_ptr<GroupMetadata> group_metadata(const Client &);

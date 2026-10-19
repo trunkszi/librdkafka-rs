@@ -174,3 +174,30 @@ fn integration_scenario_native_murmur2_and_large_flush_preserve_all_deliveries()
     }
     assert!(seen.iter().all(|seen| *seen));
 }
+
+#[test]
+fn integration_lifecycle_manual_rebalance_close_has_bounded_fallback() {
+    use std::time::{Duration, Instant};
+    let mut conf = ffi::conf_new(false);
+    for (key, value) in [
+        ("test.mock.num.brokers", "1"),
+        ("group.id", "native-manual-close"),
+        ("log_level", "0"),
+        ("partition.assignment.strategy", "cooperative-sticky"),
+    ] {
+        ffi::conf_set(conf.pin_mut(), key, value).expect("consumer configuration");
+    }
+    ffi::conf_set_observers(conf.pin_mut(), false, true);
+    let mut consumer = ffi::client_new(&conf, 1).expect("native consumer");
+    assert_eq!(
+        ffi::subscribe(consumer.pin_mut(), &["pending-rebalance".into()]),
+        0
+    );
+    for _ in 0..10 {
+        drop(ffi::consume(consumer.pin_mut(), 10));
+    }
+    ffi::consumer_close_begin(consumer.pin_mut()).expect("start close");
+    let begin = Instant::now();
+    drop(consumer);
+    assert!(begin.elapsed() < Duration::from_secs(7));
+}

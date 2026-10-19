@@ -39,6 +39,14 @@ fn algorithm(
     }
 }
 
+fn guarded(operation: impl FnOnce() -> c_int) -> c_int {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).unwrap_or(-1)
+}
+
+fn readable(data: *const u8, len: usize) -> bool {
+    len <= isize::MAX as usize && (len == 0 || !data.is_null())
+}
+
 // All entry points are private to the patched native provider. C supplies valid
 // input buffers and writable output buffers with the capacities in sasl_crypto.h.
 /// # Safety
@@ -60,15 +68,20 @@ unsafe extern "C" fn rdkafka_rs_digest(
     len: usize,
     out: *mut u8,
 ) -> c_int {
-    let Some((algorithm, _, _)) = algorithm(kind) else {
+    if out.is_null() || !readable(data, len) {
         return -1;
-    };
-    // SAFETY: C provides readable input and at least 64 writable output bytes.
-    unsafe {
-        let value = digest::digest(algorithm, input(data, len));
-        ptr::copy_nonoverlapping(value.as_ref().as_ptr(), out, value.as_ref().len());
     }
-    0
+    guarded(|| {
+        let Some((algorithm, _, _)) = algorithm(kind) else {
+            return -1;
+        };
+        // SAFETY: C provides readable input and at least 64 writable output bytes.
+        unsafe {
+            let value = digest::digest(algorithm, input(data, len));
+            ptr::copy_nonoverlapping(value.as_ref().as_ptr(), out, value.as_ref().len());
+        }
+        0
+    })
 }
 
 /// # Safety
@@ -82,16 +95,21 @@ unsafe extern "C" fn rdkafka_rs_hmac(
     len: usize,
     out: *mut u8,
 ) -> c_int {
-    let Some((_, algorithm, _)) = algorithm(kind) else {
+    if out.is_null() || !readable(key, key_len) || !readable(data, len) {
         return -1;
-    };
-    // SAFETY: C provides readable input/key and at least 64 writable output bytes.
-    unsafe {
-        let key = hmac::Key::new(algorithm, input(key, key_len));
-        let value = hmac::sign(&key, input(data, len));
-        ptr::copy_nonoverlapping(value.as_ref().as_ptr(), out, value.as_ref().len());
     }
-    0
+    guarded(|| {
+        let Some((_, algorithm, _)) = algorithm(kind) else {
+            return -1;
+        };
+        // SAFETY: C provides readable input/key and at least 64 writable output bytes.
+        unsafe {
+            let key = hmac::Key::new(algorithm, input(key, key_len));
+            let value = hmac::sign(&key, input(data, len));
+            ptr::copy_nonoverlapping(value.as_ref().as_ptr(), out, value.as_ref().len());
+        }
+        0
+    })
 }
 
 /// # Safety
@@ -106,85 +124,141 @@ unsafe extern "C" fn rdkafka_rs_pbkdf2(
     iterations: c_int,
     out: *mut u8,
 ) -> c_int {
-    let Some((digest, _, algorithm)) = algorithm(kind) else {
+    if out.is_null() || !readable(key, key_len) || !readable(salt, salt_len) {
         return -1;
-    };
-    let Ok(iterations) = u32::try_from(iterations) else {
-        return -1;
-    };
-    let Some(iterations) = NonZeroU32::new(iterations) else {
-        return -1;
-    };
-    // SAFETY: C provides readable key/salt and an output sized for this digest.
-    unsafe {
-        pbkdf2::derive(
-            algorithm,
-            iterations,
-            input(salt, salt_len),
-            input(key, key_len),
-            slice::from_raw_parts_mut(out, digest.output_len()),
-        );
     }
-    0
+    guarded(|| {
+        let Some((digest, _, algorithm)) = algorithm(kind) else {
+            return -1;
+        };
+        let Ok(iterations) = u32::try_from(iterations) else {
+            return -1;
+        };
+        let Some(iterations) = NonZeroU32::new(iterations) else {
+            return -1;
+        };
+        // SAFETY: C provides readable key/salt and an output sized for this digest.
+        unsafe {
+            pbkdf2::derive(
+                algorithm,
+                iterations,
+                input(salt, salt_len),
+                input(key, key_len),
+                slice::from_raw_parts_mut(out, digest.output_len()),
+            );
+        }
+        0
+    })
 }
 
 /// # Safety
 /// Output must point to `len` writable bytes.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn rdkafka_rs_random(out: *mut u8, len: usize) -> c_int {
-    // SAFETY: C provides len writable bytes.
-    let out = unsafe { slice::from_raw_parts_mut(out, len) };
-    if SystemRandom::new().fill(out).is_ok() {
-        0
-    } else {
-        -1
+    if out.is_null() || len > isize::MAX as usize {
+        return -1;
     }
+    guarded(|| {
+        // SAFETY: C provides len writable bytes.
+        let out = unsafe { slice::from_raw_parts_mut(out, len) };
+        if SystemRandom::new().fill(out).is_ok() {
+            0
+        } else {
+            -1
+        }
+    })
 }
 
 /// # Safety
 /// Input must be readable for `len` bytes; output must hold the encoded length plus a NUL.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn rdkafka_rs_base64(out: *mut u8, data: *const u8, len: c_int) -> c_int {
-    let Ok(len) = usize::try_from(len) else {
+    if out.is_null() || len < 0 || !readable(data, len as usize) {
         return -1;
-    };
-    let Some(capacity) = base64::encoded_len(len, true) else {
-        return -1;
-    };
-    // SAFETY: Native OAuth allocates 4 * ceil(len / 3) + 1 writable bytes.
-    unsafe {
-        let buffer = slice::from_raw_parts_mut(out, capacity + 1);
-        match STANDARD.encode_slice(input(data, len), &mut buffer[..capacity]) {
-            Ok(written) => {
-                buffer[written] = 0;
-                c_int::try_from(written).unwrap_or(-1)
-            }
-            Err(_) => -1,
-        }
     }
+    guarded(|| {
+        let Ok(len) = usize::try_from(len) else {
+            return -1;
+        };
+        let Some(capacity) = base64::encoded_len(len, true).filter(|n| *n < isize::MAX as usize)
+        else {
+            return -1;
+        };
+        // SAFETY: Native OAuth allocates 4 * ceil(len / 3) + 1 writable bytes.
+        unsafe {
+            let buffer = slice::from_raw_parts_mut(out, capacity + 1);
+            match STANDARD.encode_slice(input(data, len), &mut buffer[..capacity]) {
+                Ok(written) => {
+                    buffer[written] = 0;
+                    c_int::try_from(written).unwrap_or(-1)
+                }
+                Err(_) => -1,
+            }
+        }
+    })
 }
 
 /// # Safety
 /// Input must be readable for `len` bytes; output must hold `len / 4 * 3 + 1` bytes.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn rdkafka_rs_base64_decode(out: *mut u8, data: *const u8, len: usize) -> c_int {
-    let capacity = len / 4 * 3;
-    // SAFETY: Native decoding allocates len / 4 * 3 + 1 bytes and supplies valid input.
-    unsafe {
-        let buffer = slice::from_raw_parts_mut(out, capacity + 1);
-        match STANDARD.decode_slice(input(data, len), &mut buffer[..capacity]) {
-            Ok(written) => {
-                buffer[written] = 0;
-                c_int::try_from(written).unwrap_or(-1)
-            }
-            Err(_) => -1,
-        }
+    if out.is_null() || !readable(data, len) {
+        return -1;
     }
+    guarded(|| {
+        let capacity = len / 4 * 3;
+        // SAFETY: Native decoding allocates len / 4 * 3 + 1 bytes and supplies valid input.
+        unsafe {
+            let buffer = slice::from_raw_parts_mut(out, capacity + 1);
+            match STANDARD.decode_slice(input(data, len), &mut buffer[..capacity]) {
+                Ok(written) => {
+                    buffer[written] = 0;
+                    c_int::try_from(written).unwrap_or(-1)
+                }
+                Err(_) => -1,
+            }
+        }
+    })
 }
 
 #[cfg(test)]
 mod unit {
     use super::*;
+
+    #[test]
+    fn scenario_crypto_ffi_rejects_null_buffers_and_catches_panics() {
+        let mut out = [0u8; 64];
+        let null = ptr::null();
+        // SAFETY: Invalid pointers are rejected before dereference; valid output is sized.
+        unsafe {
+            assert_eq!(rdkafka_rs_digest(256, null, 1, out.as_mut_ptr()), -1);
+            assert_eq!(rdkafka_rs_digest(256, null, 0, ptr::null_mut()), -1);
+            assert_eq!(rdkafka_rs_hmac(256, null, 1, null, 0, out.as_mut_ptr()), -1);
+            assert_eq!(rdkafka_rs_hmac(256, null, 0, null, 1, out.as_mut_ptr()), -1);
+            assert_eq!(rdkafka_rs_hmac(256, null, 0, null, 0, ptr::null_mut()), -1);
+            assert_eq!(
+                rdkafka_rs_pbkdf2(256, null, 1, null, 0, 1, out.as_mut_ptr()),
+                -1
+            );
+            assert_eq!(
+                rdkafka_rs_pbkdf2(256, null, 0, null, 1, 1, out.as_mut_ptr()),
+                -1
+            );
+            assert_eq!(
+                rdkafka_rs_pbkdf2(256, null, 0, null, 0, 1, ptr::null_mut()),
+                -1
+            );
+            assert_eq!(rdkafka_rs_random(ptr::null_mut(), 0), -1);
+            assert_eq!(rdkafka_rs_base64(out.as_mut_ptr(), null, 1), -1);
+            assert_eq!(rdkafka_rs_base64(ptr::null_mut(), null, 0), -1);
+            assert_eq!(rdkafka_rs_base64_decode(out.as_mut_ptr(), null, 1), -1);
+            assert_eq!(rdkafka_rs_base64_decode(ptr::null_mut(), null, 0), -1);
+            assert_eq!(rdkafka_rs_digest(256, null, 0, out.as_mut_ptr()), 0);
+            assert_eq!(rdkafka_rs_base64(out.as_mut_ptr(), null, 0), 0);
+            assert_eq!(rdkafka_rs_base64_decode(out.as_mut_ptr(), null, 0), 0);
+        }
+        assert_eq!(guarded(|| panic!("crypto failure")), -1);
+    }
 
     #[test]
     fn scenario_base64_salt_decoding_rejects_malformed_input() {

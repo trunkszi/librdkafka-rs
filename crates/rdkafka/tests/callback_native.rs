@@ -266,3 +266,59 @@ fn integration_scenario_partitioner_panic_restores_callback_before_retry() -> Re
     assert_eq!(calls.get(), 2);
     Ok(())
 }
+
+#[test]
+fn integration_scenario_queue_forward_rejects_other_client_without_side_effects() -> Result<()> {
+    let config = Conf::new();
+    let first = SimpleConsumer::new(&config)?;
+    let second = SimpleConsumer::new(&config)?;
+    let source = Queue::new(&first)?;
+    let foreign = Rc::new(Queue::new(&second)?);
+    assert!(
+        matches!(source.forward(Rc::clone(&foreign)), Err(Error::Config(message)) if message == "queue belongs to another client")
+    );
+    assert_eq!(Rc::strong_count(&foreign), 1);
+    let own = Rc::new(Queue::new(&first)?);
+    source.forward(Rc::clone(&own))?;
+    assert_eq!(Rc::strong_count(&own), 2);
+    source.unforward();
+    assert_eq!(Rc::strong_count(&own), 1);
+    Ok(())
+}
+
+#[test]
+fn integration_scenario_transaction_offsets_reject_callback_reentrancy() -> Result<()> {
+    let owner: Rc<RefCell<Option<std::rc::Weak<Producer>>>> = Rc::default();
+    let producer_owner = Rc::clone(&owner);
+    let metadata: Rc<RefCell<Option<ConsumerGroupMetadata>>> = Rc::default();
+    let metadata_ref = Rc::clone(&metadata);
+    let calls = Rc::new(std::cell::Cell::new(0));
+    let captured = Rc::clone(&calls);
+    let mut config = Conf::new();
+    config.set("test.mock.num.brokers", "1")?;
+    config.delivery_report_cb(move |_| {
+        let p = producer_owner.borrow().as_ref().unwrap().upgrade().unwrap();
+        let metadata = metadata_ref.borrow();
+        assert!(matches!(
+            p.send_offsets_to_transaction(&[], metadata.as_ref().unwrap(), 100),
+            Err(Error::ReentrantDrive)
+        ));
+        captured.set(captured.get() + 1);
+    });
+    let p = Rc::new(Producer::new(&config)?);
+    *owner.borrow_mut() = Some(Rc::downgrade(&p));
+    let mut consumer_config = Conf::new();
+    consumer_config
+        .set("bootstrap.servers", &p.mock_bootstraps())?
+        .set("group.id", "offset-drive-guard")?;
+    let consumer = Consumer::new(&consumer_config)?;
+    *metadata.borrow_mut() = Some(consumer.consumer_group_metadata()?);
+    let name = format!("offset-drive-guard-{}", std::process::id());
+    let mut record = ProduceRecord::new(&name, Some(b"offset-guard"));
+    record.partition = 0;
+    p.produce(record)?;
+    p.flush(10000)?;
+    assert_eq!(calls.get(), 1);
+    consumer.close()?;
+    Ok(())
+}

@@ -54,7 +54,12 @@ pub(super) fn handshake(
     mut remote: &TcpStream,
     timeout: Duration,
 ) -> io::Result<()> {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "broker TLS timeout exceeds clock range",
+        )
+    })?;
     while connection.is_handshaking() || connection.wants_write() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -75,7 +80,7 @@ pub(super) fn handshake(
         }];
         wait(
             &mut descriptors,
-            remaining.as_millis().min(i32::MAX as u128) as i32,
+            remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
         )?;
         if descriptors[0].revents & libc::POLLOUT != 0 && connection.wants_write() {
             match connection.write_tls(&mut remote) {
@@ -183,7 +188,11 @@ fn run_loop(
         }
         let had_incoming = !incoming.empty();
         incoming.drain(&mut local)?;
-        outgoing.drain(&mut connection.writer())?;
+        // Flush queued ciphertext before asking rustls to accept more plaintext.
+        // A full rustls send buffer reports Ok(0), rather than WouldBlock.
+        if !connection.wants_write() {
+            outgoing.drain(&mut connection.writer())?;
+        }
         if remote_eof && incoming.empty() && !read_shutdown {
             local.shutdown(Shutdown::Write)?;
             read_shutdown = true;
@@ -239,6 +248,15 @@ fn run_loop(
         if stopping.load(Ordering::Acquire) {
             return Ok(());
         }
+        if descriptors[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 && !incoming.empty() {
+            incoming.drain(&mut local)?;
+            if !incoming.empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "native TLS socket closed with pending plaintext",
+                ));
+            }
+        }
         if !local_eof
             && descriptors[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
             && outgoing.empty()
@@ -246,12 +264,19 @@ fn run_loop(
         {
             local_eof = true;
         }
-        if descriptors[0].revents & libc::POLLOUT != 0 {
+        if descriptors[0].revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0
+            && connection.wants_write()
+        {
             match connection.write_tls(&mut remote) {
                 Ok(_) => {}
                 Err(error) if would_block(&error) => {}
                 Err(error) => return Err(error),
             }
+        }
+        if descriptors[0].revents & libc::POLLERR != 0
+            && let Some(error) = remote.take_error()?
+        {
+            return Err(error);
         }
         if !remote_eof
             && incoming.empty()

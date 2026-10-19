@@ -304,3 +304,130 @@ fn unit_scenario_fetched_message_survives_oauth_and_tls_dispatch_failures() {
         assert!(!core.active.get());
     }
 }
+
+#[test]
+fn unit_scenario_positive_fractional_timeout_rounds_up_without_infinite_wait() {
+    use std::time::Duration;
+    assert_eq!(timeout(Duration::ZERO).unwrap(), 0);
+    assert_eq!(timeout(Duration::from_nanos(1)).unwrap(), 1);
+    assert_eq!(timeout(Duration::from_micros(999)).unwrap(), 1);
+    assert_eq!(timeout(Duration::from_micros(1001)).unwrap(), 2);
+    assert_eq!(
+        timeout(Duration::from_millis(i32::MAX as u64)).unwrap(),
+        i32::MAX
+    );
+    assert!(timeout(Duration::from_millis(i32::MAX as u64) + Duration::from_nanos(1)).is_err());
+}
+
+#[test]
+fn integration_scenario_receive_observer_failures_are_drained_and_deferred_same_call() -> Result<()>
+{
+    let mut host = Conf::new();
+    host.set("test.mock.num.brokers", "1")?;
+    let producer = Producer::new(&host)?;
+    let topic_name = format!("observer-drain-{}", std::process::id());
+    let mut record = ProduceRecord::new(&topic_name, Some(b"observer-record"));
+    record.partition = 0;
+    producer.produce(record)?;
+    producer.flush(10000)?;
+    for mode in 0..5 {
+        let mut config = Conf::new();
+        config.set("bootstrap.servers", &producer.mock_bootstraps())?;
+        if mode < 2 || mode == 4 {
+            config.set("group.id", &format!("observer-drain-{mode}"))?;
+        }
+        let (consumer, simple) = if mode < 2 || mode == 4 {
+            (Some(Consumer::new(&config)?), None)
+        } else {
+            (None, Some(SimpleConsumer::new(&config)?))
+        };
+        let owner = consumer
+            .as_ref()
+            .map_or_else(|| &simple.as_ref().unwrap().core, |c| &c.core);
+        let weak = Rc::downgrade(owner);
+        owner.callbacks.borrow_mut().consume = Some(Box::new(move |_| {
+            weak.upgrade()
+                .unwrap()
+                .pending_events
+                .borrow_mut()
+                .push_back(event(13, "observer TLS failure"));
+        }));
+        let native_topic = if let Some(simple) = &simple {
+            Some(Topic::for_consumer(simple, &topic_name, &Conf::topic())?)
+        } else {
+            None
+        };
+        let queue = if mode == 3 {
+            Some(Queue::new(simple.as_ref().unwrap())?)
+        } else {
+            None
+        };
+        if let Some(consumer) = &consumer {
+            consumer.assign(&[TopicPartition::new(&topic_name, 0, 0)])?;
+        } else if let Some(queue) = &queue {
+            simple.as_ref().unwrap().start_queue(
+                native_topic.as_ref().unwrap(),
+                0,
+                Offset::Beginning,
+                queue,
+            )?;
+        } else {
+            simple
+                .as_ref()
+                .unwrap()
+                .start(native_topic.as_ref().unwrap(), 0, Offset::Beginning)?;
+        }
+        let receive = || -> Result<Option<Vec<u8>>> {
+            match mode {
+                0 => consumer
+                    .as_ref()
+                    .unwrap()
+                    .consume(100)
+                    .map(|m| m.and_then(|m| m.payload)),
+                1 => consumer
+                    .as_ref()
+                    .unwrap()
+                    .consume_native(100)
+                    .map(|m| m.and_then(|m| m.to_owned().payload)),
+                2 => simple
+                    .as_ref()
+                    .unwrap()
+                    .consume(native_topic.as_ref().unwrap(), 0, 100)
+                    .map(|m| m.and_then(|m| m.payload)),
+                4 => consumer
+                    .as_ref()
+                    .unwrap()
+                    .consume_batch(1, 100)
+                    .and_then(|batch| {
+                        batch.get(0).map(|record| {
+                            record.and_then(|record| record.payload.map(<[u8]>::to_vec))
+                        })
+                    }),
+                _ => queue
+                    .as_ref()
+                    .unwrap()
+                    .consume(100)
+                    .map(|m| m.and_then(|m| m.payload)),
+            }
+        };
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Some(payload) = receive()? {
+                assert_eq!(payload, b"observer-record");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "mode {mode} did not receive record"
+            );
+        }
+        assert!(matches!(receive(), Err(Error::Tls(message)) if message == "observer TLS failure"));
+        if let Some(simple) = &simple {
+            simple.stop(native_topic.as_ref().unwrap(), 0)?;
+        }
+        if let Some(consumer) = &consumer {
+            consumer.close()?;
+        }
+    }
+    Ok(())
+}

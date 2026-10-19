@@ -72,8 +72,9 @@ rust::String client_id(Client &c, int32_t kind, int32_t timeout) {
                           : rd_kafka_memberid(c.raw());
   if (!value)
     return "";
+  auto release = [&](char *text) { rd_kafka_mem_free(c.raw(), text); };
+  std::unique_ptr<char, decltype(release)> owner(value, release);
   rust::String result(value);
-  rd_kafka_mem_free(c.raw(), value);
   return result;
 }
 int32_t client_controller(Client &c, int32_t timeout) {
@@ -90,10 +91,14 @@ NativeMetadata client_metadata(Client &c, rust::Str topic, int32_t timeout) {
   rd_kafka_topic_t *t =
       name.empty() ? nullptr
                    : rd_kafka_topic_new(c.raw(), name.c_str(), nullptr);
+  std::unique_ptr<rd_kafka_topic_t, decltype(&rd_kafka_topic_destroy)>
+      topic_owner(t, rd_kafka_topic_destroy);
+  if (!name.empty() && !t) checked(rd_kafka_last_error());
   auto e = rd_kafka_metadata(c.raw(), name.empty(), t, &md, timeout);
-  if (t)
-    rd_kafka_topic_destroy(t);
+  std::unique_ptr<const rd_kafka_metadata_t, decltype(&rd_kafka_metadata_destroy)>
+      metadata_owner(md, rd_kafka_metadata_destroy);
   checked(e);
+  if (!md) throw std::runtime_error("native metadata unavailable");
   NativeMetadata out;
   for (int i = 0; i < md->broker_cnt; ++i) {
     out.broker_ids.push_back(md->brokers[i].id);
@@ -115,7 +120,6 @@ NativeMetadata client_metadata(Client &c, rust::Str topic, int32_t timeout) {
     }
     out.topics.push_back(std::move(topic));
   }
-  rd_kafka_metadata_destroy(md);
   return out;
 }
 rust::Vec<int64_t> client_watermarks(Client &c, rust::Str topic,
@@ -153,6 +157,9 @@ rust::Vec<NativePartition>
 client_partitions(Client &c, int32_t op,
                   rust::Slice<const NativePartition> input, int32_t timeout) {
   auto *list = rd_kafka_topic_partition_list_new(input.size());
+  std::unique_ptr<rd_kafka_topic_partition_list_t, decltype(&rd_kafka_topic_partition_list_destroy)>
+      owner(list, rd_kafka_topic_partition_list_destroy);
+  if (!list) throw std::bad_alloc();
   for (const auto &p : input) {
     std::string t(p.topic);
     auto *item =
@@ -213,7 +220,6 @@ client_partitions(Client &c, int32_t op,
     auto &p = list->elems[i];
     out.push_back(partition_from(p));
   }
-  rd_kafka_topic_partition_list_destroy(list);
   if (!rich_error.empty())
     throw std::runtime_error(rich_error);
   checked(e);
@@ -233,6 +239,9 @@ std::unique_ptr<Topic> topic_new(Client &c, rust::Str name, const Conf &conf) {
     if (cfg->set(p.first, p.second, e) != RdKafka::Conf::CONF_OK)
       throw std::runtime_error(e);
   auto *native = rd_kafka_topic_conf_dup(cfg->c_ptr_topic());
+  if (!native) throw std::bad_alloc();
+  std::unique_ptr<rd_kafka_topic_conf_t, decltype(&rd_kafka_topic_conf_destroy)>
+      native_owner(native, rd_kafka_topic_conf_destroy);
   if (c.state->callbacks.has_partitioner) {
     rd_kafka_topic_conf_set_opaque(native, &c.state->callbacks);
     rd_kafka_topic_conf_set_partitioner_cb(native, partitioner_string);
@@ -240,7 +249,7 @@ std::unique_ptr<Topic> topic_new(Client &c, rust::Str name, const Conf &conf) {
   auto topic = std::make_unique<Topic>();
   topic->owner = c.state;
   std::string topic_name(name);
-  topic->value = rd_kafka_topic_new(c.raw(), topic_name.c_str(), native);
+  topic->value = rd_kafka_topic_new(c.raw(), topic_name.c_str(), native_owner.release());
   if (!topic->value)
     throw std::runtime_error(std::to_string(rd_kafka_last_error()) + ":" +
                              rd_kafka_err2str(rd_kafka_last_error()));
