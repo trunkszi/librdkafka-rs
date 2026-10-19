@@ -187,9 +187,31 @@ fn integration_lifecycle_manual_rebalance_drop_has_bounded_fallback() {
 
 fn manual_rebalance_close_has_bounded_fallback(begin_close: bool) {
     use std::time::{Duration, Instant};
+    let mut host = mock_producer();
+    assert_eq!(
+        ffi::produce(
+            host.pin_mut(),
+            "pending-rebalance",
+            0,
+            &[],
+            false,
+            b"seed",
+            true,
+            &[],
+            -1,
+            0
+        ),
+        0
+    );
+    assert_eq!(ffi::client_flush(host.pin_mut(), 5_000), 0);
     let mut conf = ffi::conf_new(false);
+    ffi::conf_set(
+        conf.pin_mut(),
+        "bootstrap.servers",
+        &ffi::mock_bootstraps(&host),
+    )
+    .expect("mock cluster endpoint");
     for (key, value) in [
-        ("test.mock.num.brokers", "1"),
         ("group.id", "native-manual-close"),
         ("log_level", "0"),
         ("partition.assignment.strategy", "cooperative-sticky"),
@@ -202,9 +224,21 @@ fn manual_rebalance_close_has_bounded_fallback(begin_close: bool) {
         ffi::subscribe(consumer.pin_mut(), &["pending-rebalance".into()]),
         0
     );
-    for _ in 0..10 {
-        drop(ffi::consume(consumer.pin_mut(), 10));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut rebalance = None;
+    while Instant::now() < deadline && rebalance.is_none() {
+        drop(ffi::consume(consumer.pin_mut(), 50));
+        rebalance = ffi::client_poll(consumer.pin_mut(), 0)
+            .into_iter()
+            .find(|event| event.kind == 5);
     }
+    let rebalance = rebalance.expect("manual cooperative rebalance must precede close");
+    assert_eq!(rebalance.rebalance_protocol, "COOPERATIVE");
+    assert!(!rebalance.partitions.is_empty());
+    assert!(
+        ffi::client_partitions(consumer.pin_mut(), 0, &rebalance.partitions, 1_000).is_err(),
+        "eager assignment must be rejected during cooperative rebalance"
+    );
     let begin = Instant::now();
     if begin_close {
         ffi::consumer_close_begin(consumer.pin_mut()).expect("start close");
