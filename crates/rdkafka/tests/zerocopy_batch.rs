@@ -215,8 +215,11 @@ fn unit_lifecycle_scenario_string_columns_reuse_slots_and_bound_nested_capacity(
         column.push(&input);
     }
     assert!(column.allocated_bytes() >= 64 * 4096);
-    column
-        .clear_retained(rdkafka::BufferPolicy::unbounded().retention(64, column.allocated_bytes()));
+    column.clear_retained(rdkafka::BufferPolicy::unbounded().retention(
+        64,
+        column.allocated_bytes(),
+        column.inline_bytes(),
+    ));
     assert!(column.as_slice().is_empty());
     allocation_count::start();
     for _ in 0..64 {
@@ -228,7 +231,11 @@ fn unit_lifecycle_scenario_string_columns_reuse_slots_and_bound_nested_capacity(
         max_records: 16,
         max_bytes: 8192,
     }
-    .retention(column.record_capacity(), column.allocated_bytes());
+    .retention(
+        column.record_capacity(),
+        column.allocated_bytes(),
+        column.inline_bytes(),
+    );
     column.clear_retained(retention);
     assert!(column.record_capacity() <= 16);
     assert!(column.allocated_bytes() <= 8192);

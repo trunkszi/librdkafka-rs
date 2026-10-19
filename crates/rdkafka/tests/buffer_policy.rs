@@ -62,7 +62,11 @@ fn unit_lifecycle_scenario_owned_cow_burst_counts_and_trims_nested_capacity() {
         max_records: 8,
         max_bytes: 4096,
     }
-    .retention(column.record_capacity(), column.allocated_bytes());
+    .retention(
+        column.record_capacity(),
+        column.allocated_bytes(),
+        column.inline_bytes(),
+    );
     column.clear_retained(retention);
     assert!(column.is_empty());
     assert!(column.allocated_bytes() <= 4096);

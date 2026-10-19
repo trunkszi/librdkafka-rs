@@ -24,3 +24,25 @@ pub mod __private {
     pub use serde_bytes;
     pub use zerocopy;
 }
+
+#[cfg(feature = "http")]
+pub mod http;
+#[cfg(feature = "http")]
+pub mod oauth;
+#[cfg(feature = "http")]
+pub mod schema_registry;
+pub mod threading;
+#[cfg(feature = "tls")]
+pub mod tls;
+#[cfg(feature = "http")]
+pub use http::{HttpPreferences, HttpTransport, HttpVersionChoice};
+#[cfg(feature = "http")]
+pub use oauth::{OAuthBearerHttpClient, OAuthBearerToken, OAuthBearerTokenSetter};
+#[cfg(feature = "http")]
+pub use schema_registry::SchemaRegistryClient;
+pub use threading::{
+    ThreadLocalClient, ThreadLocalConsumer, ThreadLocalFactory, ThreadLocalProducer, WorkerBalance,
+    WorkerClient, WorkerConsumer, WorkerFactory, WorkerProducer,
+};
+#[cfg(feature = "tls")]
+pub use tls::TlsSettings;

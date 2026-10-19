@@ -190,6 +190,9 @@ impl<T: Clone + ColumnValue> MemoryBuffer for ReusableColumn<T> {
             |bytes, value| bytes.saturating_add(value.extra_bytes()),
         )
     }
+    fn inline_bytes(&self) -> usize {
+        self.values.capacity().saturating_mul(size_of::<T>())
+    }
     fn record_capacity(&self) -> usize {
         if size_of::<T>() == 0 {
             0
@@ -198,7 +201,7 @@ impl<T: Clone + ColumnValue> MemoryBuffer for ReusableColumn<T> {
         }
     }
     fn clear_retained(&mut self, retention: Retention) {
-        let target = retention.target(self.record_capacity());
+        let target = retention.record_target(self.record_capacity());
         self.len = 0;
         self.values.truncate(target);
         for value in &mut self.values {
@@ -242,5 +245,73 @@ where
         if let std::borrow::Cow::Owned(value) = self {
             value.shrink_value();
         }
+    }
+}
+
+macro_rules! tuple_values {
+    ($($ty:ident:$index:tt),+) => {
+        impl<$($ty: ColumnValue),+> ColumnValue for ($($ty,)+) {
+            fn extra_bytes(&self) -> usize { 0usize$(.saturating_add(self.$index.extra_bytes()))+ }
+            fn clear_value(&mut self, retention: Retention) { $(self.$index.clear_value(retention);)+ }
+            fn shrink_value(&mut self) { $(self.$index.shrink_value();)+ }
+        }
+    };
+}
+tuple_values!(A:0);
+tuple_values!(A:0,B:1);
+tuple_values!(A:0,B:1,C:2);
+tuple_values!(A:0,B:1,C:2,D:3);
+tuple_values!(A:0,B:1,C:2,D:3,E:4);
+tuple_values!(A:0,B:1,C:2,D:3,E:4,F:5);
+tuple_values!(A:0,B:1,C:2,D:3,E:4,F:5,G:6);
+tuple_values!(A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7);
+
+impl<K: ColumnValue + Ord, V: ColumnValue> ColumnValue for std::collections::BTreeMap<K, V> {
+    fn extra_bytes(&self) -> usize {
+        self.iter().fold(
+            self.len().saturating_mul(size_of::<(K, V)>()),
+            |bytes, (key, value)| {
+                bytes
+                    .saturating_add(key.extra_bytes())
+                    .saturating_add(value.extra_bytes())
+            },
+        )
+    }
+    fn clear_value(&mut self, _retention: Retention) {
+        // Tree nodes do not expose reusable capacity; releasing entries drops all nodes.
+        self.clear();
+    }
+    fn shrink_value(&mut self) {
+        for value in self.values_mut() {
+            value.shrink_value();
+        }
+    }
+}
+impl<K, V, S> ColumnValue for std::collections::HashMap<K, V, S>
+where
+    K: ColumnValue + Eq + std::hash::Hash,
+    V: ColumnValue,
+    S: std::hash::BuildHasher,
+{
+    fn extra_bytes(&self) -> usize {
+        self.iter().fold(
+            self.capacity().saturating_mul(size_of::<(K, V)>()),
+            |bytes, (key, value)| {
+                bytes
+                    .saturating_add(key.extra_bytes())
+                    .saturating_add(value.extra_bytes())
+            },
+        )
+    }
+    fn clear_value(&mut self, _retention: Retention) {
+        // Map entries cannot retain cleared keys without changing lookup identity.
+        self.clear();
+        self.shrink_to_fit();
+    }
+    fn shrink_value(&mut self) {
+        for value in self.values_mut() {
+            value.shrink_value();
+        }
+        self.shrink_to_fit();
     }
 }

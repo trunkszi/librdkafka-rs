@@ -26,6 +26,15 @@ proc-macro-crate = { version = "3" }
 trybuild = { version = "1" }
 static_assertions = { version = "1" }
 
+curl = { git = "https://github.com/trunkszi/curl-rust.git", branch = "feat/event-loop-ws", default-features = false, features = ["http2"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-native-certs = { version = "0.8" }
+rustls-pemfile = { version = "2" }
+url = { version = "2" }
+serde_json = { version = "1" }
+rcgen = { version = "0.13" }
+memfd = { version = "0.6" }
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 

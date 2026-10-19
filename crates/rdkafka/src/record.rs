@@ -50,3 +50,14 @@ where
     T::ref_from_bytes(payload)
         .map_err(|_| Error::Layout("payload size does not match record layout".into()))
 }
+
+/// Read an owned layout-checked payload without requiring `Clone` or `Copy`.
+/// # Errors
+/// Rejects payloads whose size does not match the type's layout.
+pub fn zerocopy_read<T>(payload: &[u8]) -> Result<T>
+where
+    T: FromBytes + IntoBytes + KnownLayout + Immutable + Unaligned,
+{
+    T::read_from_bytes(payload)
+        .map_err(|_| Error::Layout("payload size does not match record layout".into()))
+}

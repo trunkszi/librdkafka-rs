@@ -15,7 +15,7 @@ pub use sequence::{BorrowDecode, EncodedSequence, EncodedSequenceIter};
 pub use ser::Serializer;
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result, WireBatch, WireRecord};
+use crate::{BufferPolicy, Error, Result, WireBatch, WireRecord};
 
 /// Stateless adapters for compact binary or caller-provided serde formats.
 pub struct SerdeBridge;
@@ -88,9 +88,8 @@ impl SerdeBridge {
     {
         decode(payload)
     }
-    /// Append one wire frame per value using reusable serialization scratch.
-    /// Scratch is cleared before each value; existing batch records are retained.
-    /// Successfully appended records remain on a later error.
+    /// Append wire frames using scratch bounded by the default byte policy.
+    /// Scratch is empty on return; successfully appended records survive later errors.
     /// # Errors
     /// Serialization or wire batch validation errors are returned unchanged.
     pub fn encode_batch_into<T: Serialize>(
@@ -99,12 +98,31 @@ impl SerdeBridge {
         batch: &mut WireBatch,
         scratch: &mut Vec<u8>,
     ) -> Result<usize> {
-        Self::encode_batch_into_using(topic, values, batch, scratch, |value, out| {
-            value.serialize(&mut Serializer::new(out))
-        })
+        Self::encode_batch_into_with_policy(topic, values, batch, scratch, BufferPolicy::default())
     }
-    /// Append wire frames using a caller codec and a reusable scratch buffer.
-    /// Successfully appended records remain on a later error.
+    /// Append wire frames with an explicit scratch retention budget.
+    /// Only `policy.max_bytes` limits byte scratch; `max_records` applies to batches.
+    /// Scratch is empty and trimmed on success, errors, and callback unwinding.
+    /// # Errors
+    /// Serialization or wire batch validation errors are returned unchanged.
+    pub fn encode_batch_into_with_policy<T: Serialize>(
+        topic: &str,
+        values: &[T],
+        batch: &mut WireBatch,
+        scratch: &mut Vec<u8>,
+        policy: BufferPolicy,
+    ) -> Result<usize> {
+        Self::encode_batch_into_using_with_policy(
+            topic,
+            values,
+            batch,
+            scratch,
+            policy,
+            |value, out| value.serialize(&mut Serializer::new(out)),
+        )
+    }
+    /// Append wire frames using a caller codec and default scratch retention.
+    /// Scratch is empty on return; successfully appended records survive later errors.
     /// # Errors
     /// Caller codec and wire validation errors are returned unchanged.
     pub fn encode_batch_into_using<T, F>(
@@ -112,15 +130,44 @@ impl SerdeBridge {
         values: &[T],
         batch: &mut WireBatch,
         scratch: &mut Vec<u8>,
+        encode: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&T, &mut Vec<u8>) -> Result<()>,
+    {
+        Self::encode_batch_into_using_with_policy(
+            topic,
+            values,
+            batch,
+            scratch,
+            BufferPolicy::default(),
+            encode,
+        )
+    }
+    /// Append wire frames with a caller codec and explicit scratch byte retention.
+    /// `max_records` does not limit scratch. Successfully appended records remain
+    /// on later errors, and scratch is emptied and trimmed before returning.
+    /// # Errors
+    /// Caller codec and wire validation errors are returned unchanged.
+    pub fn encode_batch_into_using_with_policy<T, F>(
+        topic: &str,
+        values: &[T],
+        batch: &mut WireBatch,
+        scratch: &mut Vec<u8>,
+        policy: BufferPolicy,
         mut encode: F,
     ) -> Result<usize>
     where
         F: FnMut(&T, &mut Vec<u8>) -> Result<()>,
     {
+        let scratch = ScratchReset {
+            buffer: scratch,
+            policy,
+        };
         for value in values {
-            scratch.clear();
-            Self::encode_into_using(value, scratch, &mut encode)?;
-            batch.push(WireRecord::new(topic, Some(scratch)))?;
+            clear_scratch(scratch.buffer, policy);
+            Self::encode_into_using(value, scratch.buffer, &mut encode)?;
+            batch.push(WireRecord::new(topic, Some(scratch.buffer)))?;
         }
         Ok(values.len())
     }
@@ -222,4 +269,18 @@ fn payload(record: WireRecord<'_>) -> Result<&[u8]> {
     record
         .payload
         .ok_or_else(|| Error::Codec("cannot decode a null payload".into()))
+}
+
+struct ScratchReset<'a> {
+    buffer: &'a mut Vec<u8>,
+    policy: BufferPolicy,
+}
+impl Drop for ScratchReset<'_> {
+    fn drop(&mut self) {
+        clear_scratch(self.buffer, self.policy);
+    }
+}
+fn clear_scratch(buffer: &mut Vec<u8>, policy: BufferPolicy) {
+    buffer.clear();
+    buffer.shrink_to(policy.max_bytes);
 }

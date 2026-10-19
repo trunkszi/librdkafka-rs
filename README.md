@@ -48,7 +48,9 @@ implementation. Structs use named fields and own their storage; broker-buffer
 borrows live in the generated projection. Generic vectors use an
 `EncodedSequence` view with fallible lazy iteration; no aligned `&[T]` cast is
 attempted on positional bytes. Nested vectors and optional elements retain their
-borrowed structure until explicitly materialized. `codec = "zerocopy"` requires all five
+borrowed structure until explicitly materialized. Tuple, map, and custom fields
+keep their owned serde projections and can allocate. `ColumnValue` support for
+those types concerns allocation accounting, not a borrowed representation. `codec = "zerocopy"` requires all five
 layout traits: `FromBytes`, `IntoBytes`, `KnownLayout`, `Immutable`, and `Unaligned`.
 It projects an exact-size payload directly and rejects metadata annotations.
 
@@ -101,3 +103,46 @@ Run `bash .github/scripts/ci-incremental.sh origin/main`. Tests exercise golden
 bytes, borrow provenance, malformed input, derive diagnostics, retention,
 thread-affinity, and warmed allocation behavior. Native producer/consumer and
 live broker validation require the native-client integration.
+
+## Calling-thread HTTP extensions
+
+Enable `http` for `HttpTransport`, `OAuthBearerHttpClient`, and
+`SchemaRegistryClient`. The transport owns a persistent `curl::EventLoop` and
+rejects curl runtimes without HTTP/2 or the rustls TLS backend. Preferences
+control HTTP version negotiation, `TCP_NODELAY`, connection reuse, and
+multiplexing. Requests have positive deadlines and bounded response bodies and
+headers; synchronous DNS resolution precedes the transfer deadline.
+
+`TlsSettings` is shared with the broker transport. The standalone `tls` feature
+exposes its verified `build_client_config()` helper without enabling HTTP.
+Custom CA PEM, native trust roots, verified SNI override, and client identity
+must agree with curl's TLS options. Unverified TLS is rejected. Linux HTTP mTLS
+uses sealed anonymous memfd files because curl's rustls backend requires
+certificate/key filenames; these descriptors stay alive with the transport.
+Other platforms reject HTTP mTLS until equivalent backing is provided.
+
+OAuth client-credentials refresh runs synchronously and reports success or
+failure through `OAuthBearerTokenSetter`. Native poll callbacks can call
+`refresh` with their token setter. Configure the native principal and extensions
+explicitly. HTTPS is required by default; cleartext loopback endpoints require
+explicit opt-in for local development. Errors and Debug output omit access
+tokens, client secrets, and server response bodies.
+
+Schema Registry operations are `register_schema`, `get_schema_by_id`,
+`get_latest_subject_schema`, and `lookup_schema_id`. Caches include both subject
+and schema language/definition; latest-version requests reach the registry.
+`encode_confluent` replaces a caller-owned byte buffer with the magic byte,
+big-endian schema ID, and payload; `decode_confluent` borrows the payload.
+
+`ThreadLocalFactory` and `WorkerFactory` share factory configuration between OS
+threads while producing `!Send + !Sync` local managers. Repeated `local()` calls
+and cloned factories share one lazy pool on each OS thread. `WorkerBalance`
+supports round robin, least-in-flight, and FNV-1a key routing. Fallible leases and
+RAII restore local ownership after callback failure or panic. `reset()` releases
+the current pool; call it explicitly if clients retain their manager and create
+an ownership cycle. No client state crosses a thread boundary.
+
+HTTP tests include real HTTP/2/rustls, mTLS, OIDC, and an isolated Docker Redpanda
+Schema Registry. The live test starts and removes its own container unless
+`RDKAFKA_SCHEMA_REGISTRY_URL` selects an existing test registry. Docker is a CI
+prerequisite; a missing service is a failure, not a passing skipped test.
