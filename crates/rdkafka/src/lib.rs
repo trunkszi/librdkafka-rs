@@ -41,8 +41,8 @@ pub use oauth::{OAuthBearerHttpClient, OAuthBearerToken, OAuthBearerTokenSetter}
 #[cfg(feature = "http")]
 pub use schema_registry::SchemaRegistryClient;
 pub use threading::{
-    ThreadLocalClient, ThreadLocalConsumer, ThreadLocalFactory, ThreadLocalProducer, WorkerBalance,
-    WorkerClient, WorkerConsumer, WorkerFactory, WorkerProducer,
+    ThreadLocalClient, ThreadLocalConsumer, ThreadLocalProducer, WorkerBalance, WorkerClient,
+    WorkerConsumer, WorkerProducer, WorkerSlotLease,
 };
 #[cfg(feature = "tls")]
 pub use tls::TlsSettings;

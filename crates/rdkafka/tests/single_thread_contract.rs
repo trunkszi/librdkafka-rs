@@ -3,22 +3,22 @@ use std::rc::Rc;
 use rdkafka::{
     Result,
     threading::{
-        ThreadLocalClient, ThreadLocalConsumer, ThreadLocalFactory, ThreadLocalProducer,
-        WorkerClient, WorkerConsumer, WorkerFactory, WorkerProducer,
+        ThreadLocalClient, ThreadLocalConsumer, ThreadLocalProducer, WorkerClient, WorkerConsumer,
+        WorkerProducer, WorkerSlotLease,
     },
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
 type LocalFactory = fn() -> Result<Rc<()>>;
 type SlotFactory = fn(usize) -> Result<Rc<()>>;
-assert_not_impl_any!(ThreadLocalClient<Rc<()>, LocalFactory>: Send, Sync);
-assert_not_impl_any!(ThreadLocalProducer<(), fn() -> Result<()>>: Send, Sync);
-assert_not_impl_any!(ThreadLocalConsumer<(), fn() -> Result<()>>: Send, Sync);
-assert_not_impl_any!(WorkerClient<Rc<()>, SlotFactory>: Send, Sync);
-assert_not_impl_any!(WorkerProducer<(), fn(usize) -> Result<()>>: Send, Sync);
-assert_not_impl_any!(WorkerConsumer<(), fn(usize) -> Result<()>>: Send, Sync);
-assert_impl_all!(ThreadLocalFactory<Rc<()>, LocalFactory>: Send, Sync);
-assert_impl_all!(WorkerFactory<Rc<()>, SlotFactory>: Send, Sync);
+assert_impl_all!(ThreadLocalClient<Rc<()>, LocalFactory>: Send, Sync);
+assert_impl_all!(ThreadLocalProducer<Rc<()>, LocalFactory>: Send, Sync);
+assert_impl_all!(ThreadLocalConsumer<Rc<()>, LocalFactory>: Send, Sync);
+assert_impl_all!(WorkerClient<Rc<()>, SlotFactory>: Send, Sync);
+assert_impl_all!(WorkerProducer<Rc<()>, SlotFactory>: Send, Sync);
+assert_impl_all!(WorkerConsumer<Rc<()>, SlotFactory>: Send, Sync);
+
+assert_not_impl_any!(WorkerSlotLease<()>: Send, Sync);
 
 #[cfg(feature = "http")]
 assert_not_impl_any!(rdkafka::HttpTransport: Send, Sync);

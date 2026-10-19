@@ -1,15 +1,13 @@
-//! Synchronous local client caching and in-thread worker slot selection.
-//!
-//! Factories may share immutable configuration across OS threads. Their `local`
-//! methods create strictly thread-affine managers; clients never leave TLS.
+//! Shareable synchronous managers with client state confined to each calling OS thread.
 use std::{
     any::Any,
     cell::{Cell, RefCell},
     collections::HashMap,
     marker::PhantomData,
-    rc::{Rc, Weak},
+    ops::{Deref, DerefMut},
+    rc::Rc,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -38,14 +36,15 @@ pub struct WorkerMetrics {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 thread_local! {
-    static LOCAL_MANAGERS: RefCell<HashMap<usize, Box<dyn Any>>> = RefCell::new(HashMap::new());
-    static CLIENTS: RefCell<HashMap<u64, Option<Box<dyn Any>>>> = RefCell::new(HashMap::new());
+    static CLIENTS: RefCell<HashMap<u64, Entry>> = RefCell::new(HashMap::new());
 }
-
+struct Entry {
+    owner: Weak<()>,
+    pool: Option<Box<dyn Any>>,
+}
 fn worker_error(message: &str) -> Error {
     Error::Worker(message.into())
 }
-
 struct Slot<T> {
     client: RefCell<Option<T>>,
     dispatched: Cell<u64>,
@@ -56,63 +55,38 @@ struct Pool<T> {
     slots: Vec<Slot<T>>,
     next: Cell<usize>,
 }
-
-struct LocalInner<T> {
+struct Shared<F> {
     id: u64,
-    factory_key: Cell<Option<usize>>,
+    owner: Arc<()>,
     count: usize,
     balance: WorkerBalance,
-    factory: Box<dyn Fn(usize) -> Result<T>>,
+    factory: F,
 }
-impl<T> Drop for LocalInner<T> {
+impl<F> Drop for Shared<F> {
     fn drop(&mut self) {
-        if let Some(key) = self.factory_key.get() {
-            let removed = LOCAL_MANAGERS.try_with(|cell| {
-                cell.try_borrow_mut()
-                    .ok()
-                    .and_then(|mut map| map.remove(&key))
-            });
-            drop(removed);
-        }
-        // Destructors run after releasing the map borrow, allowing client cleanup callbacks.
         let removed = CLIENTS.try_with(|cell| {
             cell.try_borrow_mut()
                 .ok()
-                .and_then(|mut map| map.remove(&self.id))
+                .and_then(|mut entries| entries.remove(&self.id))
         });
+        // Client destructors may invoke other managers after the registry borrow ends.
         drop(removed);
     }
 }
-
-/// Local worker manager for any synchronous client type, including `!Send` clients.
-/// Clones share the same cache and routing counters on this OS thread.
-pub struct WorkerClient<T, F = fn(usize) -> Result<T>> {
-    inner: Rc<LocalInner<T>>,
-    factory_type: PhantomData<fn() -> F>,
+struct Manager<T, F> {
+    shared: Arc<Shared<F>>,
+    client_type: PhantomData<fn() -> T>,
 }
-impl<T, F> Clone for WorkerClient<T, F> {
+impl<T, F> Clone for Manager<T, F> {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
-            factory_type: PhantomData,
+            shared: self.shared.clone(),
+            client_type: PhantomData,
         }
     }
 }
-impl<T: 'static, F: Fn(usize) -> Result<T> + 'static> WorkerClient<T, F> {
-    /// Configure local slots. No client is created until the first operation.
-    ///
-    /// # Errors
-    /// Returns a worker error when `workers` is zero.
-    pub fn new(workers: usize, balance: WorkerBalance, factory: F) -> Result<Self> {
-        Self::from_factory(workers, balance, Box::new(factory))
-    }
-}
-impl<T: 'static, F> WorkerClient<T, F> {
-    fn from_factory(
-        count: usize,
-        balance: WorkerBalance,
-        factory: Box<dyn Fn(usize) -> Result<T>>,
-    ) -> Result<Self> {
+impl<T: 'static, F> Manager<T, F> {
+    fn new(count: usize, balance: WorkerBalance, factory: F) -> Result<Self> {
         if count == 0 {
             return Err(worker_error("worker count must be positive"));
         }
@@ -120,73 +94,57 @@ impl<T: 'static, F> WorkerClient<T, F> {
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| worker_error("worker identity space exhausted"))?;
         Ok(Self {
-            inner: Rc::new(LocalInner {
+            shared: Arc::new(Shared {
                 id,
-                factory_key: Cell::new(None),
+                owner: Arc::new(()),
                 count,
                 balance,
                 factory,
             }),
-            factory_type: PhantomData,
+            client_type: PhantomData,
         })
     }
-    fn for_shared_factory(
-        key: usize,
-        count: usize,
-        balance: WorkerBalance,
-        factory: Box<dyn Fn(usize) -> Result<T>>,
-    ) -> Result<Self> {
-        LOCAL_MANAGERS.with(|cell| {
-            let mut managers = cell
-                .try_borrow_mut()
-                .map_err(|_| worker_error("local manager registry is borrowed"))?;
-            if let Some(inner) = managers
-                .get(&key)
-                .and_then(|entry| entry.downcast_ref::<Weak<LocalInner<T>>>())
-                .and_then(Weak::upgrade)
-            {
-                return Ok(Self {
-                    inner,
-                    factory_type: PhantomData,
-                });
-            }
-            let manager = Self::from_factory(count, balance, factory)?;
-            managers.insert(key, Box::new(Rc::downgrade(&manager.inner)));
-            manager.inner.factory_key.set(Some(key));
-            Ok(manager)
-        })
-    }
-    pub fn workers(&self) -> usize {
-        self.inner.count
-    }
-    pub fn balance(&self) -> WorkerBalance {
-        self.inner.balance
-    }
-
-    fn pool(&self) -> Result<Rc<Pool<T>>> {
+    fn pool(&self, factory: impl Fn(usize) -> Result<T>) -> Result<Rc<Pool<T>>> {
         CLIENTS.with(|cell| {
+            let expired = {
+                let mut entries = cell
+                    .try_borrow_mut()
+                    .map_err(|_| worker_error("local cache is borrowed"))?;
+                entries
+                    .extract_if(|_, entry| entry.owner.strong_count() == 0)
+                    .map(|(_, entry)| entry)
+                    .collect::<Vec<_>>()
+            };
+            drop(expired);
             {
                 let mut entries = cell
                     .try_borrow_mut()
                     .map_err(|_| worker_error("local cache is borrowed"))?;
-                if let Some(entry) = entries.get(&self.inner.id) {
+                if let Some(entry) = entries.get(&self.shared.id) {
                     return entry
+                        .pool
                         .as_ref()
                         .ok_or_else(|| worker_error("recursive worker initialization"))?
                         .downcast_ref::<Rc<Pool<T>>>()
                         .cloned()
                         .ok_or_else(|| worker_error("local cache type mismatch"));
                 }
-                entries.insert(self.inner.id, None);
+                entries.insert(
+                    self.shared.id,
+                    Entry {
+                        owner: Arc::downgrade(&self.shared.owner),
+                        pool: None,
+                    },
+                );
             }
             let mut pending = Initialization {
-                id: self.inner.id,
+                id: self.shared.id,
                 committed: false,
             };
-            let slots = (0..self.inner.count)
+            let slots = (0..self.shared.count)
                 .map(|index| {
                     Ok(Slot {
-                        client: RefCell::new(Some((self.inner.factory)(index)?)),
+                        client: RefCell::new(Some(factory(index)?)),
                         dispatched: Cell::new(0),
                         completed: Cell::new(0),
                         active: Cell::new(0),
@@ -199,44 +157,24 @@ impl<T: 'static, F> WorkerClient<T, F> {
             });
             cell.try_borrow_mut()
                 .map_err(|_| worker_error("local cache is borrowed"))?
-                .insert(self.inner.id, Some(Box::new(pool.clone())));
+                .insert(
+                    self.shared.id,
+                    Entry {
+                        owner: Arc::downgrade(&self.shared.owner),
+                        pool: Some(Box::new(pool.clone())),
+                    },
+                );
             pending.committed = true;
             Ok(pool)
         })
     }
-
-    /// Run an operation on an available local slot.
-    ///
-    /// # Errors
-    /// Returns factory or callback errors, or a worker error if every slot is busy.
-    ///
-    /// # Panics
-    /// Propagates factory and callback panics after restoring cache and slot ownership.
-    pub fn with<R>(&self, callback: impl FnOnce(&mut T) -> Result<R>) -> Result<R> {
-        self.dispatch(None, callback)
-    }
-    /// Route using FNV-1a of `key` when the policy is `KeyHash`.
-    /// A busy hashed slot is rejected rather than rerouted to another key owner.
-    ///
-    /// # Errors
-    /// Returns factory or callback errors, or a worker error for a busy slot.
-    ///
-    /// # Panics
-    /// Propagates factory and callback panics after restoring ownership.
-    pub fn with_keyed<R>(
+    fn lease(
         &self,
-        key: &[u8],
-        callback: impl FnOnce(&mut T) -> Result<R>,
-    ) -> Result<R> {
-        self.dispatch(Some(key), callback)
-    }
-    fn dispatch<R>(
-        &self,
+        factory: impl Fn(usize) -> Result<T>,
         key: Option<&[u8]>,
-        callback: impl FnOnce(&mut T) -> Result<R>,
-    ) -> Result<R> {
-        let pool = self.pool()?;
-        let index = pool.select(self.inner.balance, key)?;
+    ) -> Result<WorkerSlotLease<T>> {
+        let pool = self.pool(factory)?;
+        let index = pool.select(self.shared.balance, key)?;
         let slot = &pool.slots[index];
         let client = slot
             .client
@@ -245,31 +183,23 @@ impl<T: 'static, F> WorkerClient<T, F> {
             .take()
             .ok_or_else(|| worker_error("worker slot is busy"))?;
         slot.dispatched.set(slot.dispatched.get().saturating_add(1));
-        slot.active.set(slot.active.get() + 1);
-        let mut lease = Lease {
-            slot,
+        slot.active.set(1);
+        Ok(WorkerSlotLease {
+            pool,
+            index,
             client: Some(client),
-        };
-        callback(
-            lease
-                .client
-                .as_mut()
-                .ok_or_else(|| worker_error("worker lease is empty"))?,
-        )
+        })
     }
-    /// Read local counters without initializing clients.
-    ///
-    /// # Errors
-    /// Returns a worker error during recursive initialization or a cache borrow conflict.
-    pub fn metrics(&self) -> Result<Vec<WorkerMetrics>> {
+    fn metrics(&self) -> Result<Vec<WorkerMetrics>> {
         CLIENTS.with(|cell| {
             let entries = cell
                 .try_borrow()
                 .map_err(|_| worker_error("local cache is borrowed"))?;
-            let Some(entry) = entries.get(&self.inner.id) else {
-                return Ok(vec![WorkerMetrics::default(); self.workers()]);
+            let Some(entry) = entries.get(&self.shared.id) else {
+                return Ok(vec![WorkerMetrics::default(); self.shared.count]);
             };
             let pool = entry
+                .pool
                 .as_ref()
                 .ok_or_else(|| worker_error("worker initialization is active"))?
                 .downcast_ref::<Rc<Pool<T>>>()
@@ -285,18 +215,14 @@ impl<T: 'static, F> WorkerClient<T, F> {
                 .collect())
         })
     }
-    /// Drop this manager's cached clients; the next operation recreates all slots.
-    /// All clones observe the reset. Active operations prevent reset.
-    ///
-    /// # Errors
-    /// Returns a worker error while initialization or an operation is active.
-    pub fn reset(&self) -> Result<()> {
+    fn reset(&self) -> Result<()> {
         let removed = CLIENTS.with(|cell| {
             let mut entries = cell
                 .try_borrow_mut()
                 .map_err(|_| worker_error("local cache is borrowed"))?;
-            if let Some(entry) = entries.get(&self.inner.id) {
+            if let Some(entry) = entries.get(&self.shared.id) {
                 let pool = entry
+                    .pool
                     .as_ref()
                     .ok_or_else(|| worker_error("worker initialization is active"))?
                     .downcast_ref::<Rc<Pool<T>>>()
@@ -305,7 +231,7 @@ impl<T: 'static, F> WorkerClient<T, F> {
                     return Err(worker_error("worker operation is active"));
                 }
             }
-            Ok(entries.remove(&self.inner.id))
+            Ok(entries.remove(&self.shared.id))
         })?;
         drop(removed);
         Ok(())
@@ -333,20 +259,33 @@ impl<T> Pool<T> {
         Err(worker_error("all local worker slots are busy"))
     }
 }
-struct Lease<'a, T> {
-    slot: &'a Slot<T>,
+
+/// Exclusive ownership of one client on the calling thread, released on drop.
+/// The lease is `!Send + !Sync`, even when `T` is transferable. It can outlive
+/// its manager; the local pool stays alive until the lease is released.
+#[must_use = "dropping the lease releases the worker slot"]
+pub struct WorkerSlotLease<T> {
+    pool: Rc<Pool<T>>,
+    index: usize,
     client: Option<T>,
 }
-impl<T> Drop for Lease<'_, T> {
+impl<T> Deref for WorkerSlotLease<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.client.as_ref().expect("live lease owns its client")
+    }
+}
+impl<T> DerefMut for WorkerSlotLease<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.client.as_mut().expect("live lease owns its client")
+    }
+}
+impl<T> Drop for WorkerSlotLease<T> {
     fn drop(&mut self) {
-        // No RefCell borrow is retained across user code.
-        if let Ok(mut destination) = self.slot.client.try_borrow_mut() {
-            *destination = self.client.take();
-        }
-        self.slot.active.set(self.slot.active.get() - 1);
-        self.slot
-            .completed
-            .set(self.slot.completed.get().saturating_add(1));
+        let slot = &self.pool.slots[self.index];
+        *slot.client.borrow_mut() = self.client.take();
+        slot.active.set(0);
+        slot.completed.set(slot.completed.get().saturating_add(1));
     }
 }
 struct Initialization {
@@ -366,34 +305,126 @@ impl Drop for Initialization {
     }
 }
 
-/// One lazy client on the current OS thread, shared by clones of this manager.
+/// Shareable manager of independent `0..N` client slots per calling OS thread.
+/// `Send + Sync` depends only on the factory `F`; `T` may be `!Send + !Sync`.
+/// Clones share identity and routing on each thread. No client crosses threads.
+/// `reset` affects only the calling thread. On final manager drop, remote caches
+/// are reclaimed on their next manager access or when their owning thread exits.
+/// If a client retains a manager clone, use `reset` to break that ownership cycle.
+pub struct WorkerClient<T, F = fn(usize) -> Result<T>> {
+    manager: Manager<T, F>,
+}
+impl<T, F> Clone for WorkerClient<T, F> {
+    fn clone(&self) -> Self {
+        Self {
+            manager: self.manager.clone(),
+        }
+    }
+}
+impl<T: 'static, F: Fn(usize) -> Result<T>> WorkerClient<T, F> {
+    /// Configure lazy per-thread slots without creating clients.
+    ///
+    /// # Errors
+    /// Returns a worker error for zero workers or exhausted manager identities.
+    pub fn new(workers: usize, balance: WorkerBalance, factory: F) -> Result<Self> {
+        Ok(Self {
+            manager: Manager::new(workers, balance, factory)?,
+        })
+    }
+    pub fn workers(&self) -> usize {
+        self.manager.shared.count
+    }
+    pub fn balance(&self) -> WorkerBalance {
+        self.manager.shared.balance
+    }
+    /// Acquire a local slot; only one lease can own a slot at a time.
+    ///
+    /// # Errors
+    /// Returns factory errors or a worker error when every slot is busy.
+    ///
+    /// # Panics
+    /// Propagates factory panics after restoring initialization state.
+    pub fn lease(&self) -> Result<WorkerSlotLease<T>> {
+        self.manager
+            .lease(|index| (self.manager.shared.factory)(index), None)
+    }
+    /// Acquire the local key owner under `KeyHash`, without rerouting a busy key.
+    ///
+    /// # Errors
+    /// Returns factory errors or a worker error for a busy slot.
+    ///
+    /// # Panics
+    /// Propagates factory panics after restoring initialization state.
+    pub fn lease_keyed(&self, key: &[u8]) -> Result<WorkerSlotLease<T>> {
+        self.manager
+            .lease(|index| (self.manager.shared.factory)(index), Some(key))
+    }
+    /// Execute on an available local slot, returning it on completion or unwind.
+    ///
+    /// # Errors
+    /// Returns factory, callback, or busy-slot errors.
+    ///
+    /// # Panics
+    /// Propagates factory and callback panics after restoring local ownership.
+    pub fn with<R>(&self, callback: impl FnOnce(&mut T) -> Result<R>) -> Result<R> {
+        let mut lease = self.lease()?;
+        callback(&mut lease)
+    }
+    /// Execute on the local key owner under `KeyHash`.
+    ///
+    /// # Errors
+    /// Returns factory, callback, or busy-slot errors.
+    ///
+    /// # Panics
+    /// Propagates factory and callback panics after restoring local ownership.
+    pub fn with_keyed<R>(
+        &self,
+        key: &[u8],
+        callback: impl FnOnce(&mut T) -> Result<R>,
+    ) -> Result<R> {
+        let mut lease = self.lease_keyed(key)?;
+        callback(&mut lease)
+    }
+    /// Read calling-thread counters without initializing clients.
+    ///
+    /// # Errors
+    /// Returns a worker error during initialization or a cache borrow conflict.
+    pub fn metrics(&self) -> Result<Vec<WorkerMetrics>> {
+        self.manager.metrics()
+    }
+    /// Release calling-thread clients; subsequent use recreates them.
+    ///
+    /// # Errors
+    /// Returns a worker error during initialization or while a lease is active.
+    pub fn reset(&self) -> Result<()> {
+        self.manager.reset()
+    }
+}
+
+/// Shareable manager of one lazy, thread-affine client per calling OS thread.
+/// `Send + Sync` depends only on `F`, independently of the client's auto traits.
+/// Reset and remote reclamation follow the same rules as [`WorkerClient`].
 pub struct ThreadLocalClient<T, F = fn() -> Result<T>> {
-    worker: WorkerClient<T, F>,
+    manager: Manager<T, F>,
 }
 impl<T, F> Clone for ThreadLocalClient<T, F> {
     fn clone(&self) -> Self {
         Self {
-            worker: self.worker.clone(),
+            manager: self.manager.clone(),
         }
     }
 }
-impl<T: 'static, F: Fn() -> Result<T> + 'static> ThreadLocalClient<T, F> {
-    /// Configure a lazy local client.
+impl<T: 'static, F: Fn() -> Result<T>> ThreadLocalClient<T, F> {
+    /// Configure one lazy client per calling OS thread.
     ///
     /// # Errors
-    /// Returns a worker error if the manager identity space is exhausted.
+    /// Returns a worker error if manager identities are exhausted.
     pub fn new(factory: F) -> Result<Self> {
         Ok(Self {
-            worker: WorkerClient::from_factory(
-                1,
-                WorkerBalance::RoundRobin,
-                Box::new(move |_| factory()),
-            )?,
+            manager: Manager::new(1, WorkerBalance::RoundRobin, factory)?,
         })
     }
-}
-impl<T: 'static, F> ThreadLocalClient<T, F> {
-    /// Access the current thread's client. Recursive access returns an error.
+    /// Access the calling thread's client. Recursive access returns an error.
     ///
     /// # Errors
     /// Returns factory, callback, or reentrant-access errors.
@@ -401,111 +432,24 @@ impl<T: 'static, F> ThreadLocalClient<T, F> {
     /// # Panics
     /// Propagates factory and callback panics after restoring ownership.
     pub fn with<R>(&self, callback: impl FnOnce(&mut T) -> Result<R>) -> Result<R> {
-        self.worker.with(callback)
+        let mut lease = self
+            .manager
+            .lease(|_| (self.manager.shared.factory)(), None)?;
+        callback(&mut lease)
     }
-    /// Drop the cached client, creating it again on the next operation.
+    /// Release the calling thread's cached client.
     ///
     /// # Errors
-    /// Returns a worker error if a callback or initialization is active.
+    /// Returns a worker error if initialization or a lease is active.
     pub fn reset(&self) -> Result<()> {
-        self.worker.reset()
+        self.manager.reset()
     }
 }
-
-/// Shareable factory configuration; only `F` determines `Send` and `Sync`.
-/// Calls to `local` on the same OS thread share one thread-affine manager.
-/// Different OS threads own independent managers and clients.
-/// If a client retains a clone of its manager, call `reset` before dropping the
-/// last external manager handle to break that ownership cycle.
-pub struct ThreadLocalFactory<T, F> {
-    factory: Arc<F>,
-    client_type: PhantomData<fn() -> T>,
-}
-impl<T, F> Clone for ThreadLocalFactory<T, F> {
-    fn clone(&self) -> Self {
-        Self {
-            factory: self.factory.clone(),
-            client_type: PhantomData,
-        }
-    }
-}
-impl<T: 'static, F: Fn() -> Result<T> + 'static> ThreadLocalFactory<T, F> {
-    pub fn new(factory: F) -> Self {
-        Self {
-            factory: Arc::new(factory),
-            client_type: PhantomData,
-        }
-    }
-    /// Obtain the lazy manager shared by this factory on the calling OS thread.
-    ///
-    /// # Errors
-    /// Returns a worker error if the manager identity space is exhausted.
-    pub fn local(&self) -> Result<ThreadLocalClient<T, F>> {
-        let factory = self.factory.clone();
-        Ok(ThreadLocalClient {
-            worker: WorkerClient::for_shared_factory(
-                Arc::as_ptr(&self.factory) as usize,
-                1,
-                WorkerBalance::RoundRobin,
-                Box::new(move |_| factory()),
-            )?,
-        })
-    }
-}
-
-/// Shareable worker configuration with a factory invoked once per local slot.
-pub struct WorkerFactory<T, F> {
-    factory: Arc<F>,
-    workers: usize,
-    balance: WorkerBalance,
-    client_type: PhantomData<fn() -> T>,
-}
-impl<T, F> Clone for WorkerFactory<T, F> {
-    fn clone(&self) -> Self {
-        Self {
-            factory: self.factory.clone(),
-            workers: self.workers,
-            balance: self.balance,
-            client_type: PhantomData,
-        }
-    }
-}
-impl<T: 'static, F: Fn(usize) -> Result<T> + 'static> WorkerFactory<T, F> {
-    /// Capture factory configuration without constructing clients.
-    ///
-    /// # Errors
-    /// Returns a worker error when `workers` is zero.
-    pub fn new(workers: usize, balance: WorkerBalance, factory: F) -> Result<Self> {
-        if workers == 0 {
-            return Err(worker_error("worker count must be positive"));
-        }
-        Ok(Self {
-            factory: Arc::new(factory),
-            workers,
-            balance,
-            client_type: PhantomData,
-        })
-    }
-    /// Obtain this factory's shared local worker slots on the calling OS thread.
-    ///
-    /// # Errors
-    /// Returns a worker error if the manager identity space is exhausted.
-    pub fn local(&self) -> Result<WorkerClient<T, F>> {
-        let factory = self.factory.clone();
-        WorkerClient::for_shared_factory(
-            Arc::as_ptr(&self.factory) as usize,
-            self.workers,
-            self.balance,
-            Box::new(move |index| factory(index)),
-        )
-    }
-}
-
-/// Generic producer factory manager; `T` supplies the concrete producer API.
+/// Shareable producer manager with one client per calling OS thread.
 pub type ThreadLocalProducer<T, F = fn() -> Result<T>> = ThreadLocalClient<T, F>;
-/// Generic consumer factory manager; `T` supplies the concrete consumer API.
+/// Shareable consumer manager with one client per calling OS thread.
 pub type ThreadLocalConsumer<T, F = fn() -> Result<T>> = ThreadLocalClient<T, F>;
-/// Generic producer slot manager, operated through `with` or `with_keyed`.
+/// Shareable producer slot manager.
 pub type WorkerProducer<T, F = fn(usize) -> Result<T>> = WorkerClient<T, F>;
-/// Generic consumer slot manager, operated through `with` or `with_keyed`.
+/// Shareable consumer slot manager.
 pub type WorkerConsumer<T, F = fn(usize) -> Result<T>> = WorkerClient<T, F>;
