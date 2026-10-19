@@ -769,6 +769,7 @@ dependencies = [
  "anyhow",
  "curl",
  "cxx",
+ "libc",
  "memfd",
  "rcgen",
  "rdkafka-macros",
@@ -805,9 +806,12 @@ dependencies = [
 name = "rdkafka-sys"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "cmake",
  "cxx",
  "cxx-build",
+ "libc",
+ "ring",
 ]
 
 [[package]]

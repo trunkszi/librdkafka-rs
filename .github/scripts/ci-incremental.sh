@@ -190,22 +190,26 @@ while IFS= read -r package; do
   cargo clippy -p "$package" --all-targets -- -D warnings
   if [ "$package" = rdkafka ]; then
     cargo clippy -p "$package" --all-targets --features tracing -- -D warnings
+    cargo clippy -p "$package" --all-targets --features tls -- -D warnings
     cargo clippy -p "$package" --all-targets --features http,tracing -- -D warnings
   fi
   if command -v cargo-nextest >/dev/null 2>&1; then
     cargo nextest run -p "$package" --no-tests=pass
     cargo test -p "$package" --doc
     if [ "$package" = rdkafka ]; then
+      cargo nextest run -p "$package" --features tls --no-tests=pass
       cargo nextest run -p "$package" --features http --no-tests=pass
       cargo test -p "$package" --features http --doc
     fi
   else
     cargo test -p "$package"
     if [ "$package" = rdkafka ]; then
+      cargo test -p "$package" --features tls
       cargo test -p "$package" --features http
     fi
   fi
   if [ "$package" = rdkafka ]; then
     bash .github/scripts/test-redpanda.sh
+    bash .github/scripts/test-broker-security.sh
   fi
 done <<< "$selected"

@@ -1,5 +1,8 @@
 //! Portable, statically linked Kafka native core and compression codec build.
 
+#[path = "build-support/sasl.rs"]
+mod sasl;
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -139,8 +142,14 @@ fn link_archive(path: &Path) {
 fn main() {
     println!("cargo:rerun-if-env-changed=LIBRDKAFKA_DIR");
     for file in [
+        "build-support/sasl.rs",
+        "build-support/sasl_crypto.h",
+        "src/sasl_crypto.rs",
         "src/lib.rs",
         "src/shim.h",
+        "src/tls.rs",
+        "src/tls_callbacks.cpp",
+        "src/tls_callbacks.h",
         "src/shim.cpp",
         "src/client.cpp",
         "src/consumer.cpp",
@@ -161,6 +170,7 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"));
     let cache = cache_dir(&manifest, &out);
     let kafka = kafka_source(&manifest, &cache);
+    let kafka = sasl::source(&kafka, &out, &manifest);
     let zlib = cached_source(
         &cache,
         "zlib",
@@ -196,6 +206,9 @@ fn main() {
         .define("WITH_CURL", "OFF")
         .define("WITH_PLUGINS", "OFF")
         .define("WITH_SASL", "OFF")
+        .define("WITH_SASL_SCRAM", "ON")
+        .define("WITH_SASL_OAUTHBEARER", "ON")
+        .define("WITH_OAUTHBEARER_OIDC", "OFF")
         .define("ENABLE_LZ4_EXT", "OFF")
         .define("WITH_ZLIB", "ON")
         .define("WITH_ZSTD", "ON")
@@ -212,6 +225,7 @@ fn main() {
         "src/admin.rs",
     ])
     .files([
+        "src/tls_callbacks.cpp",
         "src/shim.cpp",
         "src/client.cpp",
         "src/consumer.cpp",

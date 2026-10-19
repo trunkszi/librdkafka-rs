@@ -66,6 +66,9 @@ impl AdminClient {
             ffi::admin_request(native, op, requests, timeout_ms)
         };
         let callbacks = self.core.drain(0);
+        if let Err(Error::Tls(message)) = &callbacks {
+            return Err(Error::Tls(message.clone()));
+        }
         let result = outcome?;
         if result.code != 0 {
             return Err(Error::native(result.code, result.message));

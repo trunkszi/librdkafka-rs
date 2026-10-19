@@ -1,4 +1,5 @@
 #include "src/shim.h"
+#include "rdkafka-sys/src/tls_callbacks.h"
 #include "rdkafka-sys/src/lib.rs.h"
 #include <array>
 #include <fcntl.h>
@@ -215,7 +216,9 @@ int32_t Callbacks::partitioner_cb(const RdKafka::Topic *t, const void *key,
 int Callbacks::socket_cb(int domain, int type, int protocol) {
   record(8, domain, "socket", "", type, protocol);
   auto result = hooks_socket(*hooks, domain, type, protocol);
-  return result == -2 ? ::socket(domain, type, protocol) : result;
+  auto fd = result == -2 ? ::socket(domain, type, protocol) : result;
+  tls_track_socket(fd, *this);
+  return fd;
 }
 int Callbacks::open_cb(const std::string &path, int flags, int mode) {
   record(9, flags, path, "", mode);
@@ -300,6 +303,7 @@ std::unique_ptr<Client> client_new(const Conf &c, int32_t kind) {
   auto &cb = out->state->callbacks;
   cb.hooks = hooks_clone(*c.hooks);
   cb.manual_rebalance = c.rebalance_observer;
+  if (hooks_tls_enabled(*cb.hooks)) tls_install_callbacks(cfg->c_ptr_global());
   auto check = [&](auto ptr, const char *name) {
     if (cfg->set(name, ptr, e) != RdKafka::Conf::CONF_OK)
       throw std::runtime_error(e);
@@ -343,7 +347,10 @@ std::unique_ptr<Client> client_new(const Conf &c, int32_t kind) {
 rust::Vec<NativeEvent> client_poll(Client &c, int32_t timeout) {
   if (c.kind != 1)
     c.state->handle->poll(timeout);
-  return c.state->callbacks.drain();
+  auto &callbacks = c.state->callbacks;
+  for (auto &message : hooks_tls_errors(*callbacks.hooks))
+    callbacks.record(13, RD_KAFKA_RESP_ERR__SSL, std::string(message));
+  return callbacks.drain();
 }
 int32_t client_flush(Client &c, int32_t timeout) {
   return rd_kafka_flush(c.raw(), timeout);

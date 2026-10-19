@@ -66,3 +66,9 @@ mod batch_clients;
 pub use batch_clients::{BatchProduceResult, ReceivedBatch};
 pub mod admin;
 pub use admin::*;
+
+#[cfg(feature = "tls")]
+mod broker_tls;
+
+#[cfg(feature = "http")]
+mod broker_oauth;

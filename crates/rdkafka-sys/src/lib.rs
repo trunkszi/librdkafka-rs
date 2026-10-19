@@ -76,6 +76,16 @@ pub mod ffi {
         fn hooks_clone(hooks: &NativeHooks) -> Box<NativeHooks>;
         fn hooks_socket(hooks: &NativeHooks, domain: i32, kind: i32, protocol: i32) -> i32;
         fn hooks_open(hooks: &NativeHooks, path: &str, flags: i32, mode: i32) -> i32;
+        fn hooks_tls_enabled(hooks: &NativeHooks) -> bool;
+        fn hooks_tls_connect(
+            hooks: &NativeHooks,
+            fd: i32,
+            address: &str,
+            port: u16,
+            name: &str,
+        ) -> i32;
+        fn hooks_tls_close(hooks: &NativeHooks, fd: i32) -> i32;
+        fn hooks_tls_errors(hooks: &NativeHooks) -> Vec<String>;
     }
     unsafe extern "C++" {
         include!("rdkafka-sys/src/shim.h");
@@ -255,12 +265,15 @@ pub type OpenHook = Arc<dyn Fn(&str, i32, i32) -> i32 + Send + Sync>;
 pub struct NativeHooks {
     pub socket: Option<SocketHook>,
     pub open: Option<OpenHook>,
+    pub tls: Option<Arc<dyn tls::BrokerTlsHooks>>,
 }
 fn hooks_empty() -> Box<NativeHooks> {
     Box::default()
 }
 fn hooks_clone(hooks: &NativeHooks) -> Box<NativeHooks> {
-    Box::new(hooks.clone())
+    let mut copy = hooks.clone();
+    copy.tls = hooks.tls.as_ref().map(|tls| tls.fork());
+    Box::new(copy)
 }
 fn hooks_socket(hooks: &NativeHooks, domain: i32, kind: i32, protocol: i32) -> i32 {
     hooks.socket.as_ref().map_or(-2, |hook| {
@@ -280,3 +293,28 @@ fn hooks_open(hooks: &NativeHooks, path: &str, flags: i32, mode: i32) -> i32 {
 pub mod admin;
 pub mod batch;
 pub mod transactions;
+
+mod sasl_crypto;
+pub mod tls;
+
+fn hooks_tls_enabled(hooks: &NativeHooks) -> bool {
+    hooks.tls.is_some()
+}
+fn hooks_tls_connect(hooks: &NativeHooks, fd: i32, address: &str, port: u16, name: &str) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hooks
+            .tls
+            .as_ref()
+            .map_or(libc::EINVAL, |tls| tls.connect(fd, address, port, name))
+    }))
+    .unwrap_or(libc::EIO)
+}
+fn hooks_tls_close(hooks: &NativeHooks, fd: i32) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hooks.tls.as_ref().map_or(-1, |tls| tls.close(fd))
+    }))
+    .unwrap_or(-1)
+}
+fn hooks_tls_errors(hooks: &NativeHooks) -> Vec<String> {
+    hooks.tls.as_ref().map_or_else(Vec::new, |tls| tls.errors())
+}
