@@ -17,6 +17,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  CARGO_BUILD_JOBS: "2"
+  CMAKE_BUILD_PARALLEL_LEVEL: "2"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
   RUST_TEST_THREADS: "1"
@@ -43,7 +45,7 @@ jobs:
       - name: Check system dependencies
         run: |
           missing=""
-          for tool in cc c++ cmake curl git pkg-config python3; do
+          for tool in cc c++ cmake curl git pkg-config python3 docker; do
             command -v "$tool" >/dev/null || missing="$missing $tool"
           done
           if [ -n "$missing" ]; then
@@ -109,6 +111,9 @@ jobs:
           fi
           echo "BASE_SHA=$base" >> "$GITHUB_ENV"
           echo "diff base: $base"
+
+      - name: Check CI manifest contracts
+        run: python3 .github/scripts/test-ci-contracts.py
 
       - name: Run unified incremental CI
         run: bash .github/scripts/ci-incremental.sh "$BASE_SHA"
