@@ -1,0 +1,6 @@
+error: only one key field is allowed
+ --> tests/fixtures/derive/duplicate_key.rs:7:5
+  |
+7 | /     #[record(key)]
+8 | |     second: String,
+  | |__________________^

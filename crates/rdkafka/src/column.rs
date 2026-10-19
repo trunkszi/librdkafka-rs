@@ -1,0 +1,246 @@
+//! Reusable typed columns retaining nested allocation slots across clears.
+use std::{marker::PhantomData, rc::Rc};
+
+use crate::buffer_policy::{MemoryBuffer, Retention};
+
+/// Capacity accounting and trimming for values kept in reusable columns.
+///
+/// Custom types containing allocations must include those allocations here.
+pub trait ColumnValue {
+    /// Allocated bytes owned by this value, excluding its inline representation.
+    fn extra_bytes(&self) -> usize {
+        0
+    }
+    /// Clear value contents while retaining a proportional allocation budget.
+    fn clear_value(&mut self, _retention: Retention) {}
+    /// Release unused nested capacity.
+    fn shrink_value(&mut self) {}
+}
+macro_rules! plain {
+    ($($ty:ty),* $(,)?) => { $(impl ColumnValue for $ty {})* };
+}
+plain!(
+    bool,
+    char,
+    u8,
+    u16,
+    u32,
+    u64,
+    u128,
+    usize,
+    i8,
+    i16,
+    i32,
+    i64,
+    i128,
+    isize,
+    f32,
+    f64,
+    ()
+);
+impl ColumnValue for String {
+    fn extra_bytes(&self) -> usize {
+        self.capacity()
+    }
+    fn clear_value(&mut self, retention: Retention) {
+        let target = retention.target(self.capacity());
+        self.clear();
+        self.shrink_to(target);
+    }
+    fn shrink_value(&mut self) {
+        self.shrink_to_fit();
+    }
+}
+impl<T: ColumnValue> ColumnValue for Vec<T> {
+    fn extra_bytes(&self) -> usize {
+        self.iter().fold(
+            self.capacity().saturating_mul(size_of::<T>()),
+            |bytes, v| bytes.saturating_add(v.extra_bytes()),
+        )
+    }
+    fn clear_value(&mut self, retention: Retention) {
+        let target = retention.target(if size_of::<T>() == 0 {
+            0
+        } else {
+            self.capacity()
+        });
+        self.truncate(target);
+        for value in self.iter_mut() {
+            value.clear_value(retention);
+        }
+        self.shrink_to(target);
+    }
+    fn shrink_value(&mut self) {
+        for value in self.iter_mut() {
+            value.shrink_value();
+        }
+        self.shrink_to_fit();
+    }
+}
+impl<T: ColumnValue> ColumnValue for Option<T> {
+    fn extra_bytes(&self) -> usize {
+        self.as_ref().map_or(0, ColumnValue::extra_bytes)
+    }
+    fn clear_value(&mut self, retention: Retention) {
+        if let Some(value) = self {
+            value.clear_value(retention);
+        }
+    }
+    fn shrink_value(&mut self) {
+        if let Some(value) = self {
+            value.shrink_value();
+        }
+    }
+}
+impl<T: ColumnValue, const N: usize> ColumnValue for [T; N] {
+    fn extra_bytes(&self) -> usize {
+        self.iter()
+            .fold(0usize, |bytes, v| bytes.saturating_add(v.extra_bytes()))
+    }
+    fn clear_value(&mut self, retention: Retention) {
+        for value in self {
+            value.clear_value(retention);
+        }
+    }
+    fn shrink_value(&mut self) {
+        for value in self {
+            value.shrink_value();
+        }
+    }
+}
+/// A contiguous typed column with reusable initialized slots behind its length.
+///
+/// Values beyond the logical length are hidden and reused through `clone_from`.
+/// Warm allocation reuse depends on the value's `Clone::clone_from` contract;
+/// changes from `None` to an allocated `Some` may still allocate.
+#[derive(Debug)]
+pub struct ReusableColumn<T> {
+    values: Vec<T>,
+    len: usize,
+    affinity: PhantomData<Rc<()>>,
+}
+impl<T> Default for ReusableColumn<T> {
+    fn default() -> Self {
+        Self {
+            values: Vec::new(),
+            len: 0,
+            affinity: PhantomData,
+        }
+    }
+}
+impl<T: Clone + ColumnValue> ReusableColumn<T> {
+    /// Reserve inline slots for a number of records.
+    /// # Panics
+    /// Panics if the requested inline allocation exceeds the vector size limit.
+    pub fn with_capacity(records: usize) -> Self {
+        Self {
+            values: Vec::with_capacity(records),
+            len: 0,
+            affinity: PhantomData,
+        }
+    }
+    /// Number of visible values.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    /// Whether the column has no visible values.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    /// Borrow only the visible contiguous values.
+    pub fn as_slice(&self) -> &[T] {
+        &self.values[..self.len]
+    }
+    /// Update a retained slot or create a value only when no slot exists.
+    pub fn push_with(&mut self, create: impl FnOnce() -> T, update: impl FnOnce(&mut T)) {
+        if let Some(slot) = self.values.get_mut(self.len) {
+            update(slot);
+        } else {
+            self.values.push(create());
+        }
+        self.len += 1;
+    }
+    /// Release unused slots and nested allocations without discarding values.
+    pub fn shrink_to_fit(&mut self) {
+        MemoryBuffer::shrink_to_fit(self);
+    }
+    /// Move a newly decoded value into a cold slot, reusing a warm slot if present.
+    pub fn push_owned(&mut self, value: T) {
+        if let Some(slot) = self.values.get_mut(self.len) {
+            slot.clone_from(&value);
+        } else {
+            self.values.push(value);
+        }
+        self.len += 1;
+    }
+    /// Copy into an existing initialized slot, or append a new slot.
+    pub fn push(&mut self, value: &T) {
+        if let Some(slot) = self.values.get_mut(self.len) {
+            slot.clone_from(value);
+        } else {
+            self.values.push(value.clone());
+        }
+        self.len += 1;
+    }
+}
+impl<T: Clone + ColumnValue> MemoryBuffer for ReusableColumn<T> {
+    fn allocated_bytes(&self) -> usize {
+        self.values.iter().fold(
+            self.values.capacity().saturating_mul(size_of::<T>()),
+            |bytes, value| bytes.saturating_add(value.extra_bytes()),
+        )
+    }
+    fn record_capacity(&self) -> usize {
+        if size_of::<T>() == 0 {
+            0
+        } else {
+            self.values.capacity()
+        }
+    }
+    fn clear_retained(&mut self, retention: Retention) {
+        let target = retention.target(self.record_capacity());
+        self.len = 0;
+        self.values.truncate(target);
+        for value in &mut self.values {
+            value.clear_value(retention);
+        }
+        self.values.shrink_to(target);
+    }
+    fn shrink_to_fit(&mut self) {
+        self.values.truncate(self.len);
+        for value in &mut self.values {
+            value.shrink_value();
+        }
+        self.values.shrink_to_fit();
+    }
+}
+
+impl<T: Clone + ColumnValue> std::ops::Index<usize> for ReusableColumn<T> {
+    type Output = T;
+    fn index(&self, index: usize) -> &T {
+        &self.as_slice()[index]
+    }
+}
+
+impl<B> ColumnValue for std::borrow::Cow<'_, B>
+where
+    B: ToOwned + ?Sized,
+    B::Owned: ColumnValue,
+{
+    fn extra_bytes(&self) -> usize {
+        match self {
+            std::borrow::Cow::Borrowed(_) => 0,
+            std::borrow::Cow::Owned(value) => value.extra_bytes(),
+        }
+    }
+    fn clear_value(&mut self, retention: Retention) {
+        if let std::borrow::Cow::Owned(value) = self {
+            value.clear_value(retention);
+        }
+    }
+    fn shrink_value(&mut self) {
+        if let std::borrow::Cow::Owned(value) = self {
+            value.shrink_value();
+        }
+    }
+}
