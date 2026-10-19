@@ -19,15 +19,27 @@ pub fn expand(model: Model) -> TokenStream {
     for param in generics.type_params_mut() {
         param.bounds.push(parse_quote!(::core::clone::Clone));
         param.bounds.push(parse_quote!(#rt::column::ColumnValue));
-        param
-            .bounds
-            .push(parse_quote!(for<'__decode> #rt::serde_bridge::BorrowDecode<'__decode>));
-        param
-            .bounds
-            .push(parse_quote!(#rt::__private::serde::Serialize));
-        param
-            .bounds
-            .push(parse_quote!(#rt::__private::serde::de::DeserializeOwned));
+        if zerocopy {
+            for bound in [
+                parse_quote!(#rt::__private::zerocopy::FromBytes),
+                parse_quote!(#rt::__private::zerocopy::IntoBytes),
+                parse_quote!(#rt::__private::zerocopy::KnownLayout),
+                parse_quote!(#rt::__private::zerocopy::Immutable),
+                parse_quote!(#rt::__private::zerocopy::Unaligned),
+            ] {
+                param.bounds.push(bound);
+            }
+        } else {
+            param
+                .bounds
+                .push(parse_quote!(for<'__decode> #rt::serde_bridge::BorrowDecode<'__decode>));
+            param
+                .bounds
+                .push(parse_quote!(#rt::__private::serde::Serialize));
+            param
+                .bounds
+                .push(parse_quote!(#rt::__private::serde::de::DeserializeOwned));
+        }
         param.bounds.push(parse_quote!('static));
     }
     let (ig, tg, wc) = generics.split_for_impl();
@@ -87,9 +99,9 @@ pub fn expand(model: Model) -> TokenStream {
         if has_sequence(&m.ty) {
             let temp = format_ident!("__prepared_{index}", span = proc_macro2::Span::mixed_site());
             prepare.push(quote!(let #temp=#value;));
-            push_fields.push(quote!(self.#n.push_owned(#temp);));
+            push_fields.push(quote!(__rollback.batch.#n.push_owned(#temp);));
         } else {
-            push_fields.push(quote!(self.#n.push_with(||#value,|__slot|{#update});));
+            push_fields.push(quote!(__rollback.batch.#n.push_with(||#value,|__slot|{#update});));
         }
     }
     let mut enc = Vec::new();
@@ -100,7 +112,7 @@ pub fn expand(model: Model) -> TokenStream {
     let mut partition = quote!(-1i32);
     for (index, m) in members.iter().enumerate() {
         let ty = &projected[index];
-        let decode = decode_expr(&m.ty, &rt);
+        let decode = decode_expr(&m.ty, m.bytes, &rt);
         let temp = format_ident!("__field_{index}", span = proc_macro2::Span::mixed_site());
         match &m.role {
             Role::Payload => {
@@ -126,7 +138,7 @@ pub fn expand(model: Model) -> TokenStream {
                 if let Some(value) = metadata_decode(&m.ty, quote!(wire.key), &rt) {
                     dec.push(quote!(let #temp:#ty=#value;));
                 } else {
-                    let value = compact_metadata_decode(&m.ty, quote!(wire.key), &rt);
+                    let value = compact_metadata_decode(&m.ty, quote!(wire.key), m.bytes, &rt);
                     dec.push(quote!(let #temp:#ty=#value;));
                 }
             }
@@ -146,7 +158,7 @@ pub fn expand(model: Model) -> TokenStream {
                 if let Some(value) = metadata_decode(&m.ty, input.clone(), &rt) {
                     dec.push(quote!(let #temp:#ty=#value;));
                 } else {
-                    let value = compact_metadata_decode(&m.ty, input, &rt);
+                    let value = compact_metadata_decode(&m.ty, input, m.bytes, &rt);
                     dec.push(quote!(let #temp:#ty=#value;));
                 }
             }
@@ -166,7 +178,15 @@ pub fn expand(model: Model) -> TokenStream {
             Role::Header(None) => unreachable!(),
         }
     }
-    let compact_encode = quote! {destination.push_with("",#partition,-1,#timestamp,|__writer|{__writer.encode_payload(|__out|{let mut __serializer=#rt::serde_bridge::Serializer::new(__out);#(#enc)* ::core::result::Result::Ok(())})?;#(#header_encode)* ::core::result::Result::Ok(())})};
+    let payload_encode = if enc.is_empty() {
+        quote!()
+    } else {
+        quote!(__writer.encode_payload(|__out|{let mut __serializer=#rt::serde_bridge::Serializer::new(__out);#(#enc)* ::core::result::Result::Ok(())})?;)
+    };
+    let has_payload = !enc.is_empty();
+    let payload_decode = has_payload.then(||quote!(let mut __deserializer=#rt::serde_bridge::Deserializer::new(wire.payload.ok_or_else(||#rt::Error::Codec("missing record payload".into()))?);));
+    let payload_finish = has_payload.then(|| quote!(__deserializer.finish()?;));
+    let compact_encode = quote! {destination.push_with("",#partition,-1,#timestamp,|__writer|{#payload_encode #(#header_encode)* ::core::result::Result::Ok(())})};
     let encode_body = if zerocopy {
         quote!(destination.push(#rt::WireRecord::new("",::core::option::Option::Some(#rt::record::zerocopy_bytes(self)))))
     } else {
@@ -190,7 +210,7 @@ pub fn expand(model: Model) -> TokenStream {
     let view_body = if zerocopy {
         quote! {let record=#rt::record::zerocopy_ref::<Self>(wire.payload.ok_or_else(||#rt::Error::Layout("missing record payload".into()))?)?;::core::result::Result::Ok(#view{#(#names:#borrowed_values,)*#marker: ::core::marker::PhantomData})}
     } else {
-        quote! {let mut __deserializer=#rt::serde_bridge::Deserializer::new(wire.payload.ok_or_else(||#rt::Error::Codec("missing record payload".into()))?);#(#dec)* __deserializer.finish()?;::core::result::Result::Ok(#view{#(#names:#decoded,)*#marker: ::core::marker::PhantomData})}
+        quote! {#payload_decode #(#dec)* #payload_finish ::core::result::Result::Ok(#view{#(#names:#decoded,)*#marker: ::core::marker::PhantomData})}
     };
     let decode_body = if zerocopy {
         quote!(#rt::record::zerocopy_read::<Self>(wire.payload.ok_or_else(||#rt::Error::Layout("missing record payload".into()))?))
@@ -198,6 +218,33 @@ pub fn expand(model: Model) -> TokenStream {
         quote!(#rt::RecordView::to_owned(&<Self as #rt::Record>::view(wire)?))
     };
     let first = &names[0];
+    let validate_lengths = quote! {
+        let __start_len=self.#first.len();
+        if [#(self.#names.len()),*].into_iter().any(|__len|__len!=__start_len) {
+            return ::core::result::Result::Err(#rt::Error::Layout("batch column lengths differ".into()));
+        }
+    };
+    let rollback = quote! {
+        struct __BatchRollback<'__batch, __Batch> {
+            batch: &'__batch mut __Batch,
+            start_len: usize,
+            rollback: fn(&mut __Batch, usize),
+            armed: bool,
+        }
+        impl<__Batch> ::core::ops::Drop for __BatchRollback<'_, __Batch> {
+            fn drop(&mut self) {
+                if self.armed {
+                    (self.rollback)(self.batch,self.start_len);
+                }
+            }
+        }
+        let mut __rollback=__BatchRollback {
+            batch:self,
+            start_len:__start_len,
+            rollback:|__batch:&mut Self,__len|{#(__batch.#names.truncate(__len);)*},
+            armed:true,
+        };
+    };
     quote! {
         impl #ig #rt::column::ColumnValue for #ident #tg #wc {
             fn extra_bytes(&self)->usize{0usize #(.saturating_add(#rt::column::ColumnValue::extra_bytes(&self.#names)))*}
@@ -237,10 +284,22 @@ pub fn expand(model: Model) -> TokenStream {
             fn allocated_bytes(&self)->usize{0usize #(+ #rt::buffer_policy::MemoryBuffer::allocated_bytes(&self.#names))*}
             fn clear_with_policy(&mut self,policy:#rt::BufferPolicy){let capacity=[#(#rt::buffer_policy::MemoryBuffer::record_capacity(&self.#names)),*].into_iter().max().unwrap_or(0);let inline=0usize #(+ #rt::buffer_policy::MemoryBuffer::inline_bytes(&self.#names))*;let retention=policy.retention(capacity,<Self as #rt::Batch>::allocated_bytes(self),inline);#(#rt::buffer_policy::MemoryBuffer::clear_retained(&mut self.#names,retention);)*}
             fn shrink_to_fit(&mut self){#(#rt::buffer_policy::MemoryBuffer::shrink_to_fit(&mut self.#names);)*}
-            fn push(&mut self,record:&Self::Record){#(self.#names.push(&record.#names);)*}
-            fn push_ref<'__record>(&mut self,record:<Self::Record as #rt::Record>::View<'__record>)->#rt::Result<()>{#(#prepare)* #(#push_fields)* ::core::result::Result::Ok(())}
+            fn push(&mut self,record:&Self::Record){
+                let __start_len=self.#first.len();
+                assert!([#(self.#names.len()),*].into_iter().all(|__len|__len==__start_len),"batch column lengths differ");
+                #rollback
+                #(__rollback.batch.#names.push(&record.#names);)*
+                __rollback.armed=false;
+            }
+            fn push_ref<'__record>(&mut self,record:<Self::Record as #rt::Record>::View<'__record>)->#rt::Result<()>{
+                #validate_lengths
+                #rollback
+                #(#prepare)* #(#push_fields)*
+                __rollback.armed=false;
+                ::core::result::Result::Ok(())
+            }
             fn from_wire_batch(wire:&#rt::WireBatch)->#rt::Result<Self>{let mut batch=Self::with_capacity(wire.len());for record in wire.iter(){batch.push_ref(<#ident #tg as #rt::Record>::view(record)?)?;}::core::result::Result::Ok(batch)}
-            fn to_wire_batch(&self)->#rt::Result<#rt::WireBatch>{let mut wire=#rt::WireBatch::with_capacity(self.len());for __index in 0..self.len(){#batch_encode}::core::result::Result::Ok(wire)}
+            fn to_wire_batch(&self)->#rt::Result<#rt::WireBatch>{#validate_lengths let mut wire=#rt::WireBatch::with_capacity(self.len());for __index in 0..self.len(){#batch_encode}::core::result::Result::Ok(wire)}
         }
         impl #ig #batch #tg #wc {
             #compact_method
@@ -251,13 +310,13 @@ pub fn expand(model: Model) -> TokenStream {
             #[doc="Number of records in this batch."]pub fn len(&self)->usize{<Self as #rt::Batch>::len(self)}
             #[doc="Whether the batch contains no records."]pub fn is_empty(&self)->bool{self.len()==0}
             #[doc="Aggregate retained column allocation bytes."]pub fn allocated_bytes(&self)->usize{<Self as #rt::Batch>::allocated_bytes(self)}
-            #[doc="Append an owned record's fields.\n\n# Panics\nPanics if growing a column exceeds the vector size limit."]pub fn push(&mut self,record:&#ident #tg){<Self as #rt::Batch>::push(self,record)}
-            #[doc="Append a borrowed projection.\n\n# Errors\nRejects invalid encoded sequence elements before updating columns.\n\n# Panics\nPanics if growing a column exceeds the vector size limit."]pub fn push_ref<'__record>(&mut self,record:#view #vtg)->#rt::Result<()>{<Self as #rt::Batch>::push_ref(self,record)}
+            #[doc="Append an owned record's fields.\n\n# Panics\nPanics if columns have unequal lengths, cloning a field panics, or growing a column exceeds the vector size limit."]pub fn push(&mut self,record:&#ident #tg){<Self as #rt::Batch>::push(self,record)}
+            #[doc="Append a borrowed projection.\n\n# Errors\nRejects unequal column lengths or invalid encoded sequence elements. Failed appends preserve all visible column lengths.\n\n# Panics\nPanics if cloning a field panics or growing a column exceeds the vector size limit. Unwinding preserves all visible column lengths."]pub fn push_ref<'__record>(&mut self,record:#view #vtg)->#rt::Result<()>{<Self as #rt::Batch>::push_ref(self,record)}
             #[doc="Clear using the default retention budget."]pub fn clear(&mut self){<Self as #rt::Batch>::clear(self)}
             #[doc="Clear and enforce an aggregate retention budget."]pub fn clear_with_policy(&mut self,policy:#rt::BufferPolicy){<Self as #rt::Batch>::clear_with_policy(self,policy)}
             #[doc="Clear without trimming capacity."]pub fn clear_unbounded(&mut self){<Self as #rt::Batch>::clear_unbounded(self)}
             #[doc="Release unused column capacity."]pub fn shrink_to_fit(&mut self){<Self as #rt::Batch>::shrink_to_fit(self)}
-            #[doc="Encode columns into wire arenas.\n\n# Errors\nReturns a field encoding error."]pub fn to_wire_batch(&self)->#rt::Result<#rt::WireBatch>{<Self as #rt::Batch>::to_wire_batch(self)}
+            #[doc="Encode columns into wire arenas.\n\n# Errors\nReturns an error for unequal column lengths or failed field encoding."]pub fn to_wire_batch(&self)->#rt::Result<#rt::WireBatch>{<Self as #rt::Batch>::to_wire_batch(self)}
             #[doc="Decode all wire records into columns.\n\n# Errors\nRejects invalid metadata or payload encodings."]pub fn from_wire_batch(wire:&#rt::WireBatch)->#rt::Result<Self>{<Self as #rt::Batch>::from_wire_batch(wire)}
         }
     }
@@ -407,8 +466,10 @@ fn has_sequence(ty: &Type) -> bool {
         false
     }
 }
-fn decode_expr(ty: &Type, rt: &syn::Path) -> TokenStream {
-    if has_sequence(ty) {
+fn decode_expr(ty: &Type, bytes: bool, rt: &syn::Path) -> TokenStream {
+    if bytes {
+        quote!(#rt::__private::serde_bytes::deserialize(&mut __deserializer)?)
+    } else if has_sequence(ty) {
         let projected = project(ty, rt);
         quote!(<#projected as #rt::serde_bridge::BorrowDecode>::borrow_decode(&mut __deserializer)?)
     } else {
@@ -450,11 +511,18 @@ fn compact_metadata_write(
         present
     }
 }
-fn compact_metadata_decode(ty: &Type, input: TokenStream, rt: &syn::Path) -> TokenStream {
+fn compact_metadata_decode(
+    ty: &Type,
+    input: TokenStream,
+    bytes: bool,
+    rt: &syn::Path,
+) -> TokenStream {
     let inner = argument(ty, "Option");
     let actual = inner.as_ref().unwrap_or(ty);
     let projected = project(actual, rt);
-    let decode = if has_sequence(actual) {
+    let decode = if bytes {
+        quote!(#rt::__private::serde_bytes::deserialize(&mut __metadata)?)
+    } else if has_sequence(actual) {
         quote!(<#projected as #rt::serde_bridge::BorrowDecode>::borrow_decode(&mut __metadata)?)
     } else {
         quote!(#rt::__private::serde::Deserialize::deserialize(&mut __metadata)?)

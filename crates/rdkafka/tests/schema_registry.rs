@@ -103,3 +103,84 @@ fn integration_scenario_latest_is_fresh_and_successful_lookup_caches_identity() 
     assert_eq!(client.get_schema_by_id(3).unwrap(), schema);
     assert_eq!(server.join().unwrap().len(), 3);
 }
+
+#[test]
+fn integration_scenario_invalid_subjects_fail_before_http() {
+    let (url, server) = http_server::serve(vec![(200, r#"{"id":9}"#.into())]);
+    let mut client =
+        SchemaRegistryClient::new(HttpTransport::new(TlsSettings::default()).unwrap(), url);
+    let schema = Schema::new("s", SchemaType::Avro);
+    for subject in ["", " ", "\t\r\n", ".", ".."] {
+        assert!(client.register_schema(subject, &schema).is_err());
+        assert!(client.lookup_schema(subject, &schema).is_err());
+        assert!(client.lookup_schema_id(subject, &schema).is_err());
+        assert!(client.get_latest_subject_schema(subject).is_err());
+    }
+    assert_eq!(client.register_schema("valid", &schema).unwrap(), 9);
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("POST /subjects/valid/versions "));
+}
+
+#[test]
+fn integration_scenario_invalid_registration_ids_retry_without_cache() {
+    for bad in ["{", "{}", r#"{"id":-1}"#, r#"{"id":4294967296}"#] {
+        let (url, server) =
+            http_server::serve(vec![(200, bad.into()), (200, r#"{"id":17}"#.into())]);
+        let mut client =
+            SchemaRegistryClient::new(HttpTransport::new(TlsSettings::default()).unwrap(), url);
+        let schema = Schema::new("s", SchemaType::Avro);
+        assert!(client.register_schema("s", &schema).is_err());
+        assert_eq!(client.register_schema("s", &schema).unwrap(), 17);
+        assert_eq!(client.lookup_schema_id("s", &schema).unwrap(), 17);
+        assert_eq!(client.get_schema_by_id(17).unwrap(), schema);
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn integration_scenario_invalid_lookup_responses_retry_without_cache() {
+    let valid = serde_json::json!({
+        "id": 19, "subject": "s", "version": 1, "schema": "definition", "schemaType": "JSON"
+    });
+    let mut responses = vec!["{".to_owned()];
+    for (field, value) in [
+        ("id", serde_json::Value::Null),
+        ("id", serde_json::json!(-1)),
+        ("id", serde_json::json!(4294967296u64)),
+        ("version", serde_json::json!(0)),
+        ("version", serde_json::json!(4294967296u64)),
+        ("schema", serde_json::Value::Null),
+        ("schemaType", serde_json::json!("AVRO")),
+    ] {
+        let mut bad = valid.clone();
+        if value.is_null() {
+            bad.as_object_mut().unwrap().remove(field);
+        } else {
+            bad[field] = value;
+        }
+        responses.push(bad.to_string());
+    }
+    for bad in responses {
+        let (url, server) = http_server::serve(vec![
+            (200, bad),
+            (
+                200,
+                r#"{"schema":"global-definition","schemaType":"JSON"}"#.into(),
+            ),
+            (200, valid.to_string()),
+        ]);
+        let mut client =
+            SchemaRegistryClient::new(HttpTransport::new(TlsSettings::default()).unwrap(), url);
+        let schema = Schema::new("definition", SchemaType::Json);
+        assert!(client.lookup_schema("s", &schema).is_err());
+        assert_eq!(
+            client.get_schema_by_id(19).unwrap().schema,
+            "global-definition"
+        );
+        assert_eq!(client.lookup_schema_id("s", &schema).unwrap(), 19);
+        assert_eq!(client.register_schema("s", &schema).unwrap(), 19);
+        assert_eq!(client.get_schema_by_id(19).unwrap(), schema);
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+}

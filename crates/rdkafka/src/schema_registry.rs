@@ -91,13 +91,14 @@ impl SchemaRegistryClient {
     /// Register a schema under a subject, reusing a previously resolved identity.
     ///
     /// # Errors
-    /// Rejects HTTP failures and malformed registry responses.
+    /// Rejects invalid subjects, HTTP failures, and malformed registry responses.
     pub fn register_schema(&mut self, subject: &str, schema: &Schema) -> Result<u32> {
+        let encoded = encode_subject(subject)?;
         let key = (subject.to_owned(), schema.clone());
         if let Some(id) = self.cache.borrow().subjects.get(&key) {
             return Ok(*id);
         }
-        let path = format!("/subjects/{}/versions", percent_encode(subject));
+        let path = format!("/subjects/{encoded}/versions");
         let value = self.request("POST", &path, Some(schema.json()))?;
         let id = schema_id(&value)?;
         let mut cache = self.cache.borrow_mut();
@@ -121,25 +122,19 @@ impl SchemaRegistryClient {
     /// Fetch the current latest version for a subject without caching its freshness.
     ///
     /// # Errors
-    /// Rejects unknown subjects and inconsistent or malformed identities.
+    /// Rejects invalid or unknown subjects and inconsistent or malformed identities.
     pub fn get_latest_subject_schema(&mut self, subject: &str) -> Result<RegisteredSchema> {
-        let value = self.request(
-            "GET",
-            &format!("/subjects/{}/versions/latest", percent_encode(subject)),
-            None,
-        )?;
+        let encoded = encode_subject(subject)?;
+        let value = self.request("GET", &format!("/subjects/{encoded}/versions/latest"), None)?;
         self.registered(subject, &value)
     }
     /// Resolve an existing subject/schema pair without registering it.
     ///
     /// # Errors
-    /// Rejects failed lookups, mismatched subjects, or a different returned schema.
+    /// Rejects invalid subjects, failed lookups, or mismatched subjects and schemas.
     pub fn lookup_schema(&mut self, subject: &str, schema: &Schema) -> Result<RegisteredSchema> {
-        let value = self.request(
-            "POST",
-            &format!("/subjects/{}", percent_encode(subject)),
-            Some(schema.json()),
-        )?;
+        let encoded = encode_subject(subject)?;
+        let value = self.request("POST", &format!("/subjects/{encoded}"), Some(schema.json()))?;
         let registered = parse_registered(subject, &value)?;
         if registered.schema != *schema {
             return Err(registry_error("lookup returned a different schema"));
@@ -150,8 +145,9 @@ impl SchemaRegistryClient {
     /// Resolve the ID of an already registered subject/schema pair.
     ///
     /// # Errors
-    /// Rejects unknown schemas and invalid registry responses.
+    /// Rejects invalid subjects, unknown schemas, and invalid registry responses.
     pub fn lookup_schema_id(&mut self, subject: &str, schema: &Schema) -> Result<u32> {
+        encode_subject(subject)?;
         let key = (subject.to_owned(), schema.clone());
         if let Some(id) = self.cache.borrow().subjects.get(&key) {
             return Ok(*id);
@@ -203,6 +199,12 @@ impl SchemaRegistryClient {
         serde_json::from_slice(&response.body)
             .map_err(|_| registry_error("invalid registry response JSON"))
     }
+}
+fn encode_subject(subject: &str) -> Result<String> {
+    if subject.trim().is_empty() || matches!(subject, "." | "..") {
+        return Err(registry_error("invalid registry subject"));
+    }
+    Ok(percent_encode(subject))
 }
 fn registry_error(message: &str) -> Error {
     Error::SchemaRegistry(message.into())

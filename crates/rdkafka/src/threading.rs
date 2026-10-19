@@ -105,68 +105,70 @@ impl<T: 'static, F> Manager<T, F> {
         })
     }
     fn pool(&self, factory: impl Fn(usize) -> Result<T>) -> Result<Rc<Pool<T>>> {
-        CLIENTS.with(|cell| {
-            let expired = {
-                let mut entries = cell
-                    .try_borrow_mut()
-                    .map_err(|_| worker_error("local cache is borrowed"))?;
-                entries
-                    .extract_if(|_, entry| entry.owner.strong_count() == 0)
-                    .map(|(_, entry)| entry)
-                    .collect::<Vec<_>>()
-            };
-            drop(expired);
-            {
-                let mut entries = cell
-                    .try_borrow_mut()
-                    .map_err(|_| worker_error("local cache is borrowed"))?;
-                if let Some(entry) = entries.get(&self.shared.id) {
-                    return entry
-                        .pool
-                        .as_ref()
-                        .ok_or_else(|| worker_error("recursive worker initialization"))?
-                        .downcast_ref::<Rc<Pool<T>>>()
-                        .cloned()
-                        .ok_or_else(|| worker_error("local cache type mismatch"));
+        CLIENTS
+            .try_with(|cell| {
+                let expired = {
+                    let mut entries = cell
+                        .try_borrow_mut()
+                        .map_err(|_| worker_error("local cache is borrowed"))?;
+                    entries
+                        .extract_if(|_, entry| entry.owner.strong_count() == 0)
+                        .map(|(_, entry)| entry)
+                        .collect::<Vec<_>>()
+                };
+                drop(expired);
+                {
+                    let mut entries = cell
+                        .try_borrow_mut()
+                        .map_err(|_| worker_error("local cache is borrowed"))?;
+                    if let Some(entry) = entries.get(&self.shared.id) {
+                        return entry
+                            .pool
+                            .as_ref()
+                            .ok_or_else(|| worker_error("recursive worker initialization"))?
+                            .downcast_ref::<Rc<Pool<T>>>()
+                            .cloned()
+                            .ok_or_else(|| worker_error("local cache type mismatch"));
+                    }
+                    entries.insert(
+                        self.shared.id,
+                        Entry {
+                            owner: Arc::downgrade(&self.shared.owner),
+                            pool: None,
+                        },
+                    );
                 }
-                entries.insert(
-                    self.shared.id,
-                    Entry {
-                        owner: Arc::downgrade(&self.shared.owner),
-                        pool: None,
-                    },
-                );
-            }
-            let mut pending = Initialization {
-                id: self.shared.id,
-                committed: false,
-            };
-            let slots = (0..self.shared.count)
-                .map(|index| {
-                    Ok(Slot {
-                        client: RefCell::new(Some(factory(index)?)),
-                        dispatched: Cell::new(0),
-                        completed: Cell::new(0),
-                        active: Cell::new(0),
+                let mut pending = Initialization {
+                    id: self.shared.id,
+                    committed: false,
+                };
+                let slots = (0..self.shared.count)
+                    .map(|index| {
+                        Ok(Slot {
+                            client: RefCell::new(Some(factory(index)?)),
+                            dispatched: Cell::new(0),
+                            completed: Cell::new(0),
+                            active: Cell::new(0),
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let pool = Rc::new(Pool {
-                slots,
-                next: Cell::new(0),
-            });
-            cell.try_borrow_mut()
-                .map_err(|_| worker_error("local cache is borrowed"))?
-                .insert(
-                    self.shared.id,
-                    Entry {
-                        owner: Arc::downgrade(&self.shared.owner),
-                        pool: Some(Box::new(pool.clone())),
-                    },
-                );
-            pending.committed = true;
-            Ok(pool)
-        })
+                    .collect::<Result<Vec<_>>>()?;
+                let pool = Rc::new(Pool {
+                    slots,
+                    next: Cell::new(0),
+                });
+                cell.try_borrow_mut()
+                    .map_err(|_| worker_error("local cache is borrowed"))?
+                    .insert(
+                        self.shared.id,
+                        Entry {
+                            owner: Arc::downgrade(&self.shared.owner),
+                            pool: Some(Box::new(pool.clone())),
+                        },
+                    );
+                pending.committed = true;
+                Ok(pool)
+            })
+            .map_err(|_| worker_error("local cache is unavailable during thread teardown"))?
     }
     fn lease(
         &self,
@@ -191,48 +193,52 @@ impl<T: 'static, F> Manager<T, F> {
         })
     }
     fn metrics(&self) -> Result<Vec<WorkerMetrics>> {
-        CLIENTS.with(|cell| {
-            let entries = cell
-                .try_borrow()
-                .map_err(|_| worker_error("local cache is borrowed"))?;
-            let Some(entry) = entries.get(&self.shared.id) else {
-                return Ok(vec![WorkerMetrics::default(); self.shared.count]);
-            };
-            let pool = entry
-                .pool
-                .as_ref()
-                .ok_or_else(|| worker_error("worker initialization is active"))?
-                .downcast_ref::<Rc<Pool<T>>>()
-                .ok_or_else(|| worker_error("local cache type mismatch"))?;
-            Ok(pool
-                .slots
-                .iter()
-                .map(|slot| WorkerMetrics {
-                    dispatched: slot.dispatched.get(),
-                    completed: slot.completed.get(),
-                    in_flight: slot.active.get(),
-                })
-                .collect())
-        })
-    }
-    fn reset(&self) -> Result<()> {
-        let removed = CLIENTS.with(|cell| {
-            let mut entries = cell
-                .try_borrow_mut()
-                .map_err(|_| worker_error("local cache is borrowed"))?;
-            if let Some(entry) = entries.get(&self.shared.id) {
+        CLIENTS
+            .try_with(|cell| {
+                let entries = cell
+                    .try_borrow()
+                    .map_err(|_| worker_error("local cache is borrowed"))?;
+                let Some(entry) = entries.get(&self.shared.id) else {
+                    return Ok(vec![WorkerMetrics::default(); self.shared.count]);
+                };
                 let pool = entry
                     .pool
                     .as_ref()
                     .ok_or_else(|| worker_error("worker initialization is active"))?
                     .downcast_ref::<Rc<Pool<T>>>()
                     .ok_or_else(|| worker_error("local cache type mismatch"))?;
-                if pool.slots.iter().any(|slot| slot.active.get() != 0) {
-                    return Err(worker_error("worker operation is active"));
+                Ok(pool
+                    .slots
+                    .iter()
+                    .map(|slot| WorkerMetrics {
+                        dispatched: slot.dispatched.get(),
+                        completed: slot.completed.get(),
+                        in_flight: slot.active.get(),
+                    })
+                    .collect())
+            })
+            .map_err(|_| worker_error("local cache is unavailable during thread teardown"))?
+    }
+    fn reset(&self) -> Result<()> {
+        let removed = CLIENTS
+            .try_with(|cell| {
+                let mut entries = cell
+                    .try_borrow_mut()
+                    .map_err(|_| worker_error("local cache is borrowed"))?;
+                if let Some(entry) = entries.get(&self.shared.id) {
+                    let pool = entry
+                        .pool
+                        .as_ref()
+                        .ok_or_else(|| worker_error("worker initialization is active"))?
+                        .downcast_ref::<Rc<Pool<T>>>()
+                        .ok_or_else(|| worker_error("local cache type mismatch"))?;
+                    if pool.slots.iter().any(|slot| slot.active.get() != 0) {
+                        return Err(worker_error("worker operation is active"));
+                    }
                 }
-            }
-            Ok(entries.remove(&self.shared.id))
-        })?;
+                Ok(entries.remove(&self.shared.id))
+            })
+            .map_err(|_| worker_error("local cache is unavailable during thread teardown"))??;
         drop(removed);
         Ok(())
     }
@@ -340,7 +346,8 @@ impl<T: 'static, F: Fn(usize) -> Result<T>> WorkerClient<T, F> {
     /// Acquire a local slot; only one lease can own a slot at a time.
     ///
     /// # Errors
-    /// Returns factory errors or a worker error when every slot is busy.
+    /// Returns factory errors or a worker error when every slot is busy or
+    /// thread-local state is unavailable during teardown.
     ///
     /// # Panics
     /// Propagates factory panics after restoring initialization state.
@@ -351,11 +358,15 @@ impl<T: 'static, F: Fn(usize) -> Result<T>> WorkerClient<T, F> {
     /// Acquire the local key owner under `KeyHash`, without rerouting a busy key.
     ///
     /// # Errors
-    /// Returns factory errors or a worker error for a busy slot.
+    /// Returns factory errors or a worker error for a busy slot, unavailable
+    /// thread-local state, or a policy other than `KeyHash`.
     ///
     /// # Panics
     /// Propagates factory panics after restoring initialization state.
     pub fn lease_keyed(&self, key: &[u8]) -> Result<WorkerSlotLease<T>> {
+        if self.balance() != WorkerBalance::KeyHash {
+            return Err(worker_error("keyed worker access requires KeyHash balance"));
+        }
         self.manager
             .lease(|index| (self.manager.shared.factory)(index), Some(key))
     }
@@ -373,7 +384,7 @@ impl<T: 'static, F: Fn(usize) -> Result<T>> WorkerClient<T, F> {
     /// Execute on the local key owner under `KeyHash`.
     ///
     /// # Errors
-    /// Returns factory, callback, or busy-slot errors.
+    /// Returns factory, callback, or busy-slot errors, and rejects other policies.
     ///
     /// # Panics
     /// Propagates factory and callback panics after restoring local ownership.
@@ -388,14 +399,16 @@ impl<T: 'static, F: Fn(usize) -> Result<T>> WorkerClient<T, F> {
     /// Read calling-thread counters without initializing clients.
     ///
     /// # Errors
-    /// Returns a worker error during initialization or a cache borrow conflict.
+    /// Returns a worker error during initialization, a cache borrow conflict,
+    /// or thread-local teardown.
     pub fn metrics(&self) -> Result<Vec<WorkerMetrics>> {
         self.manager.metrics()
     }
     /// Release calling-thread clients; subsequent use recreates them.
     ///
     /// # Errors
-    /// Returns a worker error during initialization or while a lease is active.
+    /// Returns a worker error during initialization, while a lease is active,
+    /// or during thread-local teardown.
     pub fn reset(&self) -> Result<()> {
         self.manager.reset()
     }
@@ -427,7 +440,8 @@ impl<T: 'static, F: Fn() -> Result<T>> ThreadLocalClient<T, F> {
     /// Access the calling thread's client. Recursive access returns an error.
     ///
     /// # Errors
-    /// Returns factory, callback, or reentrant-access errors.
+    /// Returns factory, callback, or reentrant-access errors, including
+    /// unavailable thread-local state during teardown.
     ///
     /// # Panics
     /// Propagates factory and callback panics after restoring ownership.
@@ -440,7 +454,8 @@ impl<T: 'static, F: Fn() -> Result<T>> ThreadLocalClient<T, F> {
     /// Release the calling thread's cached client.
     ///
     /// # Errors
-    /// Returns a worker error if initialization or a lease is active.
+    /// Returns a worker error if initialization or a lease is active, or
+    /// thread-local state is unavailable during teardown.
     pub fn reset(&self) -> Result<()> {
         self.manager.reset()
     }
@@ -453,3 +468,73 @@ pub type ThreadLocalConsumer<T, F = fn() -> Result<T>> = ThreadLocalClient<T, F>
 pub type WorkerProducer<T, F = fn(usize) -> Result<T>> = WorkerClient<T, F>;
 /// Shareable consumer slot manager.
 pub type WorkerConsumer<T, F = fn(usize) -> Result<T>> = WorkerClient<T, F>;
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::atomic::AtomicUsize,
+    };
+
+    use super::*;
+
+    #[test]
+    fn unit_scenario_keyed_access_rejects_non_hash_policies_before_initialization() {
+        for policy in [WorkerBalance::RoundRobin, WorkerBalance::LeastInFlight] {
+            let created = Cell::new(0);
+            let workers = WorkerClient::new(2, policy, |_| {
+                created.set(created.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+            assert!(matches!(workers.lease_keyed(b"key"), Err(Error::Worker(_))));
+            assert!(matches!(
+                workers.with_keyed(b"key", |_| Ok(())),
+                Err(Error::Worker(_))
+            ));
+            assert_eq!(created.get(), 0);
+        }
+    }
+
+    struct TeardownProbe {
+        workers: WorkerClient<usize>,
+        errors: Arc<AtomicUsize>,
+    }
+    impl Drop for TeardownProbe {
+        fn drop(&mut self) {
+            let results = [
+                catch_unwind(AssertUnwindSafe(|| self.workers.lease().map(drop))),
+                catch_unwind(AssertUnwindSafe(|| self.workers.metrics().map(drop))),
+                catch_unwind(AssertUnwindSafe(|| self.workers.reset())),
+            ];
+            for result in results {
+                if matches!(result, Ok(Err(Error::Worker(_)))) {
+                    self.errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    thread_local! {
+        static TEARDOWN_PROBE: RefCell<Option<TeardownProbe>> = const { RefCell::new(None) };
+    }
+
+    #[test]
+    fn unit_lifecycle_thread_teardown_returns_worker_errors_without_panicking() {
+        let errors = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&errors);
+        std::thread::spawn(move || {
+            let workers = WorkerClient::<usize>::new(1, WorkerBalance::RoundRobin, Ok).unwrap();
+            // Initialize this key first so CLIENTS is destroyed before the probe.
+            TEARDOWN_PROBE.with(|probe| {
+                *probe.borrow_mut() = Some(TeardownProbe {
+                    workers: workers.clone(),
+                    errors: observed,
+                });
+            });
+            workers.with(|_| Ok(())).unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(errors.load(Ordering::Relaxed), 3);
+    }
+}

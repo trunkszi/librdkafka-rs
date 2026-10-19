@@ -150,3 +150,111 @@ fn integration_lifecycle_scenario_native_oauth_token_target() -> Result<()> {
     OAuthBearerTokenSetter::oauthbearer_set_token(&mut producer, &token)?;
     Ok(())
 }
+
+#[path = "support/http_server.rs"]
+mod http_server;
+
+#[test]
+fn integration_lifecycle_scenario_native_refresh_http_rejection_then_retry_recovers() -> Result<()>
+{
+    let (url, server) = http_server::serve(vec![
+        (401, "private-server-body client-secret access-token".into()),
+        (
+            200,
+            r#"{"access_token":"recovered-token","expires_in":120}"#.into(),
+        ),
+    ]);
+    let mut config = OAuthBearerConfig::new(url, "client", "client-secret");
+    config.allow_insecure_loopback_http = true;
+    config.principal = "native-user".into();
+    let mut http = OAuthBearerHttpClient::new(HttpTransport::new(TlsSettings::default())?, config);
+    struct NativeTarget {
+        handle: Weak<Producer>,
+        failures: Rc<Cell<usize>>,
+        installed: Rc<Cell<usize>>,
+    }
+    impl OAuthBearerTokenSetter for NativeTarget {
+        fn oauthbearer_set_token(&mut self, token: &OAuthBearerToken) -> Result<()> {
+            assert_eq!(token.access_token, "recovered-token");
+            self.handle
+                .upgrade()
+                .expect("producer alive")
+                .oauthbearer_set_token(
+                    &token.access_token,
+                    token.expires_at_ms,
+                    &token.principal,
+                    &[],
+                )?;
+            self.installed.set(self.installed.get() + 1);
+            Ok(())
+        }
+        fn oauthbearer_set_token_failure(&mut self, reason: &str) -> Result<()> {
+            assert_eq!(reason, "OAuth bearer refresh failed");
+            self.handle
+                .upgrade()
+                .expect("producer alive")
+                .oauthbearer_set_token_failure(reason)?;
+            self.failures.set(self.failures.get() + 1);
+            Ok(())
+        }
+    }
+    let failures = Rc::new(Cell::new(0));
+    let installed = Rc::new(Cell::new(0));
+    let callbacks = Rc::new(Cell::new(0));
+    let target = Rc::new(std::cell::RefCell::new(NativeTarget {
+        handle: Weak::new(),
+        failures: Rc::clone(&failures),
+        installed: Rc::clone(&installed),
+    }));
+    let callback_target = Rc::clone(&target);
+    let callback_count = Rc::clone(&callbacks);
+    let owner = std::thread::current().id();
+    let mut conf = Conf::new();
+    conf.set("bootstrap.servers", "127.0.0.1:1")?
+        .set("security.protocol", "SASL_PLAINTEXT")?
+        .set("sasl.mechanisms", "OAUTHBEARER")?;
+    conf.oauthbearer_token_refresh_cb(move |_| {
+        assert_eq!(owner, std::thread::current().id());
+        callback_count.set(callback_count.get() + 1);
+        let result = http.refresh(&mut *callback_target.borrow_mut());
+        if callback_count.get() == 1 {
+            let error = result
+                .expect_err("HTTP rejection fails refresh")
+                .to_string();
+            assert!(error.contains("token endpoint rejected request"));
+            for secret in ["private-server-body", "client-secret", "access-token"] {
+                assert!(!error.contains(secret));
+            }
+            Ok(())
+        } else {
+            result
+        }
+    });
+    let producer = Rc::new(Producer::new(&conf)?);
+    target.borrow_mut().handle = Rc::downgrade(&producer);
+    assert_eq!(callbacks.get(), 0);
+    // Native token failure schedules a refresh after its ten-second retry interval.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while installed.get() == 0 && Instant::now() < deadline {
+        producer.poll(20)?;
+    }
+    assert_eq!(failures.get(), 1, "native failure notification accepted");
+    assert_eq!(callbacks.get(), 2, "native retry delivered through polling");
+    assert_eq!(
+        installed.get(),
+        1,
+        "retry installed the recovered HTTP token"
+    );
+    let lifetime = Rc::downgrade(&producer);
+    drop(producer);
+    assert!(lifetime.upgrade().is_none());
+    drop(conf);
+    let requests = server.join().expect("join OAuth HTTP endpoint");
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.starts_with("POST / "))
+    );
+    Ok(())
+}
