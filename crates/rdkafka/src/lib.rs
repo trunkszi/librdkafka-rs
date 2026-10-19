@@ -9,7 +9,7 @@ mod received;
 mod types;
 pub use callbacks::*;
 pub use children::{Queue, Topic};
-pub use client::{Consumer, KafkaConsumer, Producer, SimpleConsumer};
+pub use client::{Consumer, KafkaConsumer, ProduceRequest, Producer, SimpleConsumer};
 pub use conf::Conf;
 pub use error::{Error, ErrorCode, Result};
 pub use received::ReceivedMessage;
@@ -60,3 +60,9 @@ pub use threading::{
 };
 #[cfg(feature = "tls")]
 pub use tls::TlsSettings;
+mod transactions;
+pub use transactions::{ConsumerGroupMetadata, PurgeFlags};
+mod batch_clients;
+pub use batch_clients::{BatchProduceResult, ReceivedBatch};
+pub mod admin;
+pub use admin::*;

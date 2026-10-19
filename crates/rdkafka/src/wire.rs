@@ -20,6 +20,7 @@ pub struct WireHeaders<'a> {
 #[derive(Debug, Clone, Copy)]
 enum HeaderSource<'a> {
     Slice(&'a [WireHeader<'a>]),
+    Owned(&'a crate::Headers),
     Arena(&'a [HeaderIndex], &'a [u8]),
 }
 impl<'a> Default for WireHeaders<'a> {
@@ -35,10 +36,18 @@ impl<'a> WireHeaders<'a> {
             affinity: PhantomData,
         }
     }
+    /// Borrow owned header metadata without copying header names or values.
+    pub fn from_headers(headers: &'a crate::Headers) -> Self {
+        Self {
+            source: HeaderSource::Owned(headers),
+            affinity: PhantomData,
+        }
+    }
     /// Number of headers, including duplicates.
     pub fn len(self) -> usize {
         match self.source {
             HeaderSource::Slice(v) => v.len(),
+            HeaderSource::Owned(v) => v.len(),
             HeaderSource::Arena(v, _) => v.len(),
         }
     }
@@ -50,6 +59,13 @@ impl<'a> WireHeaders<'a> {
     pub fn get(self, index: usize) -> Option<WireHeader<'a>> {
         match self.source {
             HeaderSource::Slice(v) => v.get(index).copied(),
+            HeaderSource::Owned(v) => {
+                let h = v.iter().nth(index)?;
+                Some(WireHeader {
+                    name: &h.name,
+                    value: h.value.as_deref(),
+                })
+            }
             HeaderSource::Arena(v, bytes) => {
                 let entry = v.get(index)?;
                 Some(WireHeader {

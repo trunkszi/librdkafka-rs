@@ -121,7 +121,10 @@ fn integration_lifecycle_group_offsets_and_metadata() -> Result<()> {
     let target = TopicPartition::new(&topic, 0, 1);
     group.offsets_store(std::slice::from_ref(&target))?;
     group.commit_sync(std::slice::from_ref(&target))?;
-    assert_eq!(group.committed(std::slice::from_ref(&target))?[0].offset, 1);
+    assert_eq!(
+        group.committed(std::slice::from_ref(&target), Duration::from_secs(5))?[0].offset,
+        1
+    );
     group.commit_async(&[target])?;
     while commits.borrow().is_empty() {
         group.consume(100)?;
@@ -266,12 +269,24 @@ fn integration_lifecycle_subscribe_rebalance_and_unsubscribe() -> Result<()> {
     c.rebalance_cb(move |code, parts| {
         assert_eq!(thread, std::thread::current().id());
         cc.borrow_mut().push((code, parts.len()));
-        if code == -175
-            && let Some(consumer) = local.borrow().as_ref().and_then(std::rc::Weak::upgrade)
-        {
+        let consumer = local
+            .borrow()
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade)
+            .expect("consumer remains alive");
+        assert_eq!(consumer.rebalance_protocol(), "EAGER");
+        if code == -175 {
             consumer
-                .assignment()
-                .expect("rebalance observer may query its client");
+                .assign(parts)
+                .expect("rebalance callback assigns explicitly");
+            assert_eq!(
+                consumer.assignment().expect("assignment query").len(),
+                parts.len()
+            );
+        } else if code == -174 {
+            consumer
+                .unassign()
+                .expect("rebalance callback revokes explicitly");
         }
     });
     let consumer = Rc::new(Consumer::new(&c)?);

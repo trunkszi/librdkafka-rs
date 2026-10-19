@@ -28,6 +28,7 @@ public:
   Callbacks();
   ~Callbacks();
   rust::Box<NativeHooks> hooks;
+  bool manual_rebalance = false;
   std::unique_ptr<EventQueue> events;
   rust::Vec<NativeEvent> drain();
   void record(int kind, int code, std::string text, std::string topic = "",
@@ -49,11 +50,14 @@ public:
   int open_cb(const std::string &, int, int) override;
 };
 struct State {
+  ~State();
   Callbacks callbacks;
   std::unique_ptr<RdKafka::Handle> handle;
 };
 struct Conf {
   bool topic;
+  bool consume_observer = false;
+  bool rebalance_observer = false;
   std::vector<std::pair<std::string, std::string>> properties;
   std::unique_ptr<RdKafka::Conf> value;
   rust::Box<NativeHooks> hooks;
@@ -61,8 +65,10 @@ struct Conf {
   ~Conf();
 };
 struct Client {
+  ~Client();
   std::shared_ptr<State> state;
   int kind;
+  std::unique_ptr<rd_kafka_queue_t, decltype(&rd_kafka_queue_destroy)> close_queue{nullptr, rd_kafka_queue_destroy};
   rd_kafka_t *raw() const { return state->handle->c_ptr(); }
 };
 struct Topic {
@@ -87,6 +93,7 @@ int32_t partitioner_string(const rd_kafka_topic_t *, const void *, size_t,
                            int32_t, void *, void *);
 std::unique_ptr<Conf> conf_new(bool);
 void conf_set_hooks(Conf &, rust::Box<NativeHooks>);
+void conf_set_observers(Conf &, bool, bool);
 rust::String mock_bootstraps(const Client &);
 void oauth_set_token(Client &, rust::Str, int64_t, rust::Str,
                      rust::Slice<const rust::String>);
@@ -105,17 +112,23 @@ NativeEvent client_fatal(Client &);
 int32_t produce(Client &, rust::Str, int32_t, rust::Slice<const uint8_t>, bool,
                 rust::Slice<const uint8_t>, bool,
                 rust::Slice<const NativeHeader>, int64_t, uint64_t);
+int32_t produce_topic(Client &, const Topic &, int32_t, rust::Slice<const uint8_t>, bool,
+                      rust::Slice<const uint8_t>, bool,
+                      rust::Slice<const NativeHeader>, int64_t, uint64_t);
 NativeMetadata client_metadata(Client &, rust::Str, int32_t);
 rust::Vec<int64_t> client_watermarks(Client &, rust::Str, int32_t, int32_t,
                                      bool);
 rust::Vec<NativePartition> client_partitions(Client &, int32_t,
                                              rust::Slice<const NativePartition>,
                                              int32_t);
+NativePartition partition_from(const rd_kafka_topic_partition_t &);
+void partition_to(rd_kafka_topic_partition_t &, const NativePartition &);
 int32_t subscribe(Client &, rust::Slice<const rust::String>);
 int32_t unsubscribe(Client &);
 rust::Vec<NativePartition> consumer_list(Client &, bool);
 std::unique_ptr<Message> consume(Client &, int32_t);
-int32_t consumer_close(Client &);
+void consumer_close_begin(Client &);
+bool consumer_close_poll(Client &, int32_t);
 std::unique_ptr<Topic> topic_new(Client &, rust::Str, const Conf &);
 rust::String topic_name(const Topic &);
 bool topic_available(const Topic &, int32_t);

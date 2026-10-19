@@ -55,6 +55,22 @@ struct EventQueue {
 Callbacks::Callbacks()
     : hooks(hooks_empty()), events(std::make_unique<EventQueue>()) {}
 Callbacks::~Callbacks() = default;
+State::~State() {
+  callbacks.manual_rebalance = false;
+  if (auto *consumer = dynamic_cast<RdKafka::KafkaConsumer *>(handle.get())) {
+    if (!rd_kafka_consumer_closed(consumer->c_ptr())) consumer->close();
+  }
+}
+Client::~Client() {
+  if (!state) return;
+  state->callbacks.manual_rebalance = false;
+  if (close_queue) {
+    while (!rd_kafka_consumer_closed(raw())) {
+      auto *message = rd_kafka_consume_queue(close_queue.get(), 100);
+      if (message) rd_kafka_message_destroy(message);
+    }
+  }
+}
 Conf::~Conf() = default;
 static std::string str(rust::Str s) { return std::string(s); }
 void Callbacks::record(int kind, int code, std::string text, std::string topic,
@@ -85,27 +101,84 @@ rust::Vec<NativeEvent> Callbacks::drain() {
   return out;
 }
 void Callbacks::dr_cb(RdKafka::Message &m) {
-  record(0, m.err(), m.errstr(), m.topic_name(), m.partition(), m.offset(),
-         reinterpret_cast<uintptr_t>(m.msg_opaque()));
+  NativeEvent event{};
+  event.kind = 0;
+  event.code = m.err();
+  event.message = m.errstr();
+  event.topic = m.topic_name();
+  event.partition = m.partition();
+  event.offset = m.offset();
+  event.token = reinterpret_cast<uintptr_t>(m.msg_opaque());
+  event.status = static_cast<int32_t>(m.status());
+  event.latency_us = m.latency();
+  events->push(std::move(event));
 }
 void Callbacks::event_cb(RdKafka::Event &e) {
-  record(1 + static_cast<int>(e.type()), e.err(), e.str());
+  NativeEvent event{};
+  event.kind = 1 + static_cast<int>(e.type());
+  event.code = e.err();
+  event.message = e.str();
+  event.broker_name = e.broker_name();
+  event.broker_id = e.broker_id();
+  event.throttle_ms = e.throttle_time();
+  event.log_level = static_cast<int32_t>(e.severity());
+  event.log_facility = e.fac();
+  event.fatal = e.fatal();
+  events->push(std::move(event));
 }
 void Callbacks::consume_cb(RdKafka::Message &m, void *) {
-  record(10, m.err(), m.errstr(), m.topic_name(), m.partition(), m.offset());
+  NativeEvent event{};
+  event.kind = 10;
+  event.code = m.err();
+  event.message = m.errstr();
+  event.topic = m.topic_name();
+  event.partition = m.partition();
+  event.offset = m.offset();
+  auto timestamp = m.timestamp();
+  event.timestamp = timestamp.type == RdKafka::MessageTimestamp::MSG_TIMESTAMP_NOT_AVAILABLE
+                        ? -1 : timestamp.timestamp;
+  auto *raw = m.c_ptr();
+  event.has_key = raw->key != nullptr;
+  event.has_payload = raw->payload != nullptr;
+  auto *key = static_cast<const uint8_t *>(raw->key);
+  auto *payload = static_cast<const uint8_t *>(raw->payload);
+  for (size_t i = 0; i < raw->key_len; ++i) event.key.push_back(key[i]);
+  if (!raw->err)
+    for (size_t i = 0; i < raw->len; ++i) event.payload.push_back(payload[i]);
+  rd_kafka_headers_t *headers = nullptr;
+  if (!rd_kafka_message_headers(raw, &headers)) {
+    for (size_t i = 0;; ++i) {
+      const char *name; const void *value; size_t size;
+      if (rd_kafka_header_get_all(headers, i, &name, &value, &size)) break;
+      NativeHeader header{};
+      header.name = name;
+      header.has_value = value != nullptr;
+      auto *bytes = static_cast<const uint8_t *>(value);
+      for (size_t n = 0; n < size; ++n) header.value.push_back(bytes[n]);
+      event.headers.push_back(std::move(header));
+    }
+  }
+  events->push(std::move(event));
 }
 static NativeEvent
 partition_event(int kind, RdKafka::ErrorCode code,
                 std::vector<RdKafka::TopicPartition *> &partitions) {
   NativeEvent event{kind, code, "", "", -1, -1, 0, {}};
-  for (const auto *p : partitions)
-    event.partitions.push_back(
-        {rust::String(p->topic()), p->partition(), p->offset(), p->err()});
+  for (auto *p : partitions) {
+    NativePartition part{rust::String(p->topic()), p->partition(), p->offset(), p->err(),
+                         p->get_leader_epoch(), {}};
+    for (auto byte : p->get_metadata()) part.metadata.push_back(byte);
+    event.partitions.push_back(std::move(part));
+  }
   return event;
 }
 void Callbacks::rebalance_cb(RdKafka::KafkaConsumer *c, RdKafka::ErrorCode e,
                              std::vector<RdKafka::TopicPartition *> &p) {
-  events->push(partition_event(5, e, p));
+  auto event = partition_event(5, e, p);
+  event.assignment_lost = c->assignment_lost();
+  event.rebalance_protocol = c->rebalance_protocol();
+  events->push(std::move(event));
+  if (manual_rebalance) return;
   if (c->rebalance_protocol() == "COOPERATIVE") {
     auto *error = e == RdKafka::ERR__ASSIGN_PARTITIONS
                       ? c->incremental_assign(p)
@@ -226,12 +299,15 @@ std::unique_ptr<Client> client_new(const Conf &c, int32_t kind) {
       throw std::runtime_error(e);
   auto &cb = out->state->callbacks;
   cb.hooks = hooks_clone(*c.hooks);
+  cb.manual_rebalance = c.rebalance_observer;
   auto check = [&](auto ptr, const char *name) {
     if (cfg->set(name, ptr, e) != RdKafka::Conf::CONF_OK)
       throw std::runtime_error(e);
   };
   check(static_cast<RdKafka::DeliveryReportCb *>(&cb), "dr_cb");
   check(static_cast<RdKafka::EventCb *>(&cb), "event_cb");
+  if (c.consume_observer)
+    check(static_cast<RdKafka::ConsumeCb *>(&cb), "consume_cb");
   check(static_cast<RdKafka::SocketCb *>(&cb), "socket_cb");
   check(static_cast<RdKafka::OpenCb *>(&cb), "open_cb");
   check(static_cast<RdKafka::OAuthBearerTokenRefreshCb *>(&cb),
@@ -259,6 +335,7 @@ std::unique_ptr<Client> client_new(const Conf &c, int32_t kind) {
     out->state->handle.reset(RdKafka::Consumer::create(cfg.get(), e));
   if (!out->state->handle)
     throw std::runtime_error(e);
+  rd_kafka_set_log_queue(out->raw(), nullptr);
   if (kind == 1)
     rd_kafka_poll_set_consumer(out->raw());
   return out;
@@ -302,6 +379,10 @@ uint8_t error_flags(int32_t code) {
 } // namespace kafka_bridge
 
 namespace kafka_bridge {
+void conf_set_observers(Conf &c, bool consume, bool rebalance) {
+  c.consume_observer = consume;
+  c.rebalance_observer = rebalance;
+}
 void conf_set_hooks(Conf &c, rust::Box<NativeHooks> hooks) {
   c.hooks = std::move(hooks);
 }

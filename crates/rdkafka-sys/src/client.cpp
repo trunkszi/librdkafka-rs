@@ -1,12 +1,14 @@
 #include "rdkafka-sys/src/lib.rs.h"
 #include "src/shim.h"
 #include <stdexcept>
+#include <cstdlib>
+#include <cstring>
 namespace kafka_bridge {
 static void checked(rd_kafka_resp_err_t e) {
   if (e)
     throw std::runtime_error(std::to_string(e) + ":" + rd_kafka_err2str(e));
 }
-int32_t produce(Client &c, rust::Str topic, int32_t partition,
+static int32_t produce_impl(Client &c, const Topic *handle, rust::Str topic, int32_t partition,
                 rust::Slice<const uint8_t> key, bool has_key,
                 rust::Slice<const uint8_t> payload, bool has_payload,
                 rust::Slice<const NativeHeader> headers, int64_t timestamp,
@@ -30,7 +32,13 @@ int32_t produce(Client &c, rust::Str topic, int32_t partition,
           ? (payload.empty() ? &empty : const_cast<uint8_t *>(payload.data()))
           : nullptr;
   const void *k = has_key ? (key.empty() ? &empty : key.data()) : nullptr;
-  auto e = rd_kafka_producev(
+  auto e = handle ? rd_kafka_producev(
+      c.raw(), RD_KAFKA_V_RKT(handle->value), RD_KAFKA_V_PARTITION(partition),
+      RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY), RD_KAFKA_V_KEY(k, key.size()),
+      RD_KAFKA_V_VALUE(data, payload.size()), RD_KAFKA_V_HEADERS(h),
+      RD_KAFKA_V_TIMESTAMP(timestamp),
+      RD_KAFKA_V_OPAQUE(reinterpret_cast<void *>(static_cast<uintptr_t>(token))),
+      RD_KAFKA_V_END) : rd_kafka_producev(
       c.raw(), RD_KAFKA_V_TOPIC(name.c_str()), RD_KAFKA_V_PARTITION(partition),
       RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY), RD_KAFKA_V_KEY(k, key.size()),
       RD_KAFKA_V_VALUE(data, payload.size()), RD_KAFKA_V_HEADERS(h),
@@ -41,6 +49,23 @@ int32_t produce(Client &c, rust::Str topic, int32_t partition,
   if (e)
     rd_kafka_headers_destroy(h);
   return e;
+}
+int32_t produce(Client &c, rust::Str topic, int32_t partition,
+                rust::Slice<const uint8_t> key, bool has_key,
+                rust::Slice<const uint8_t> payload, bool has_payload,
+                rust::Slice<const NativeHeader> headers, int64_t timestamp,
+                uint64_t token) {
+  return produce_impl(c, nullptr, topic, partition, key, has_key, payload,
+                      has_payload, headers, timestamp, token);
+}
+int32_t produce_topic(Client &c, const Topic &topic, int32_t partition,
+                      rust::Slice<const uint8_t> key, bool has_key,
+                      rust::Slice<const uint8_t> payload, bool has_payload,
+                      rust::Slice<const NativeHeader> headers, int64_t timestamp,
+                      uint64_t token) {
+  if (topic.owner != c.state) return RD_KAFKA_RESP_ERR__INVALID_ARG;
+  return produce_impl(c, &topic, rd_kafka_topic_name(topic.value), partition,
+                      key, has_key, payload, has_payload, headers, timestamp, token);
 }
 rust::String client_id(Client &c, int32_t kind, int32_t timeout) {
   char *value = kind == 0 ? rd_kafka_clusterid(c.raw(), timeout)
@@ -107,6 +132,23 @@ rust::Vec<int64_t> client_watermarks(Client &c, rust::Str topic,
   out.push_back(hi);
   return out;
 }
+NativePartition partition_from(const rd_kafka_topic_partition_t &p) {
+  NativePartition out{rust::String(p.topic), p.partition, p.offset, p.err,
+                      rd_kafka_topic_partition_get_leader_epoch(&p), {}};
+  auto *data = static_cast<const uint8_t *>(p.metadata);
+  for (size_t i = 0; i < p.metadata_size; ++i) out.metadata.push_back(data[i]);
+  return out;
+}
+void partition_to(rd_kafka_topic_partition_t &item, const NativePartition &p) {
+  item.offset = p.offset;
+  rd_kafka_topic_partition_set_leader_epoch(&item, p.leader_epoch);
+  if (!p.metadata.empty()) {
+    item.metadata = std::malloc(p.metadata.size());
+    if (!item.metadata) throw std::bad_alloc();
+    std::memcpy(item.metadata, p.metadata.data(), p.metadata.size());
+    item.metadata_size = p.metadata.size();
+  }
+}
 rust::Vec<NativePartition>
 client_partitions(Client &c, int32_t op,
                   rust::Slice<const NativePartition> input, int32_t timeout) {
@@ -115,7 +157,7 @@ client_partitions(Client &c, int32_t op,
     std::string t(p.topic);
     auto *item =
         rd_kafka_topic_partition_list_add(list, t.c_str(), p.partition);
-    item->offset = p.offset;
+    partition_to(*item, p);
   }
   rd_kafka_resp_err_t e = RD_KAFKA_RESP_ERR_NO_ERROR;
   std::string rich_error;
@@ -169,7 +211,7 @@ client_partitions(Client &c, int32_t op,
   rust::Vec<NativePartition> out;
   for (int i = 0; i < list->cnt; ++i) {
     auto &p = list->elems[i];
-    out.push_back({rust::String(p.topic), p.partition, p.offset, p.err});
+    out.push_back(partition_from(p));
   }
   rd_kafka_topic_partition_list_destroy(list);
   if (!rich_error.empty())

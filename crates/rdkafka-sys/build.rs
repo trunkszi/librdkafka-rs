@@ -144,6 +144,16 @@ fn main() {
         "src/shim.cpp",
         "src/client.cpp",
         "src/consumer.cpp",
+        "src/transactions.rs",
+        "src/transactions.h",
+        "src/transactions.cpp",
+        "src/batch.rs",
+        "src/batch.h",
+        "src/batch.cpp",
+        "src/admin.rs",
+        "src/admin.h",
+        "src/admin.cpp",
+        "src/admin_results.cpp",
     ] {
         println!("cargo:rerun-if-changed={file}");
     }
@@ -195,13 +205,26 @@ fn main() {
         .define("ZSTD_LIBRARY_RELEASE", &zstd_archive)
         .define("ZSTD_INCLUDE_DIR", zstd_dst.join("include"))
         .build();
-    cxx_build::bridge("src/lib.rs")
-        .files(["src/shim.cpp", "src/client.cpp", "src/consumer.cpp"])
-        .include(&manifest)
-        .include(dst.join("include/librdkafka"))
-        .define("LIBRDKAFKA_STATICLIB", None)
-        .std("c++17")
-        .compile("rdkafka-bridge");
+    cxx_build::bridges([
+        "src/lib.rs",
+        "src/transactions.rs",
+        "src/batch.rs",
+        "src/admin.rs",
+    ])
+    .files([
+        "src/shim.cpp",
+        "src/client.cpp",
+        "src/consumer.cpp",
+        "src/transactions.cpp",
+        "src/batch.cpp",
+        "src/admin.cpp",
+        "src/admin_results.cpp",
+    ])
+    .include(&manifest)
+    .include(dst.join("include/librdkafka"))
+    .define("LIBRDKAFKA_STATICLIB", None)
+    .std("c++17")
+    .compile("rdkafka-bridge");
     for prefix in [&dst, &zlib_dst, &zstd_dst] {
         println!(
             "cargo:rustc-link-search=native={}",

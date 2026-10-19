@@ -7,6 +7,21 @@ use crate::{
     core::{Core, from_parts, message, status},
     *,
 };
+/// An enqueue request using a topic name or an owned topic configuration.
+pub enum ProduceRequest<'a> {
+    Record(ProduceRecord<'a>),
+    Topic(&'a Topic, ProduceRecord<'a>),
+}
+impl<'a> From<ProduceRecord<'a>> for ProduceRequest<'a> {
+    fn from(record: ProduceRecord<'a>) -> Self {
+        Self::Record(record)
+    }
+}
+impl<'a> From<(&'a Topic, ProduceRecord<'a>)> for ProduceRequest<'a> {
+    fn from((topic, record): (&'a Topic, ProduceRecord<'a>)) -> Self {
+        Self::Topic(topic, record)
+    }
+}
 /// A synchronous producer whose callbacks execute during caller polling.
 pub struct Producer {
     pub(crate) core: Rc<Core>,
@@ -25,7 +40,11 @@ impl Producer {
     /// Enqueues a record, preserving null keys and payloads.
     /// # Errors
     /// Returns metadata, partitioner, or native enqueue failures.
-    pub fn produce(&self, record: ProduceRecord<'_>) -> Result<()> {
+    pub fn produce<'a>(&self, request: impl Into<ProduceRequest<'a>>) -> Result<()> {
+        let record = match request.into() {
+            ProduceRequest::Record(record) => record,
+            ProduceRequest::Topic(topic, record) => return self.produce_to_topic(topic, record),
+        };
         #[cfg(feature = "tracing")]
         tracing::trace!(
             topic = record.topic,
@@ -38,52 +57,7 @@ impl Producer {
                 crate::core::text(&h.name)?;
             }
         }
-        let mut partition = record.partition;
-        let has_partitioner = {
-            let c = self.core.callbacks.borrow();
-            c.partitioner.is_some() || c.key_partitioner.is_some()
-        };
-        if partition == PARTITION_UA && has_partitioner {
-            let cached = self.counts.borrow().get(record.topic).copied();
-            let count = if let Some(v) = cached {
-                v
-            } else {
-                let m = self.metadata(Some(record.topic), 5000)?;
-                let n = m
-                    .topics
-                    .iter()
-                    .find(|t| t.name == record.topic)
-                    .map_or(0, |t| t.partitions.len() as i32);
-                if n <= 0 {
-                    return Err(Error::native(3, "topic has no available partitions"));
-                }
-                self.counts.borrow_mut().insert(record.topic.into(), n);
-                n
-            };
-            let callback = self.core.callbacks.borrow_mut().partitioner.take();
-            if let Some(mut cb) = callback {
-                partition = cb(record.topic, record.key, count);
-                let mut c = self.core.callbacks.borrow_mut();
-                if c.partitioner.is_none() {
-                    c.partitioner = Some(cb);
-                }
-            } else {
-                let callback = self.core.callbacks.borrow_mut().key_partitioner.take();
-                if let Some(mut cb) = callback {
-                    partition = cb(record.topic, record.key, count);
-                    let mut c = self.core.callbacks.borrow_mut();
-                    if c.key_partitioner.is_none() {
-                        c.key_partitioner = Some(cb);
-                    }
-                }
-            }
-            if partition < 0 || partition >= count {
-                return Err(Error::native(
-                    -186,
-                    "partitioner returned an unavailable partition",
-                ));
-            }
-        }
+        let partition = self.resolve_partition(record.topic, record.key, record.partition)?;
         let headers: Vec<_> = record
             .headers
             .into_iter()
@@ -107,9 +81,115 @@ impl Producer {
             record.token,
         ))
     }
+    /// Enqueues through an owned topic's configuration and local partitioner.
+    /// The topic handle determines the destination; `record.topic` is ignored.
+    /// # Errors
+    /// Returns ownership, metadata, partitioner, or native enqueue errors.
+    pub fn produce_to_topic(&self, topic: &Topic, record: ProduceRecord<'_>) -> Result<()> {
+        if !Rc::ptr_eq(&self.core, &topic.core) {
+            return Err(Error::Config("topic belongs to another producer".into()));
+        }
+        let name = topic.name();
+        let local = {
+            let callbacks = topic.callbacks.borrow();
+            callbacks.partitioner.is_some() || callbacks.key_partitioner.is_some()
+        };
+        let callbacks = if local {
+            &topic.callbacks
+        } else {
+            &self.core.callbacks
+        };
+        let partition =
+            self.resolve_partition_using(callbacks, &name, record.key, record.partition)?;
+        let mut headers = Vec::new();
+        for header in record.headers.into_iter().flat_map(Headers::iter) {
+            crate::core::text(&header.name)?;
+            headers.push(ffi::NativeHeader {
+                name: header.name.clone(),
+                value: header.value.clone().unwrap_or_default(),
+                has_value: header.value.is_some(),
+            });
+        }
+        status(ffi::produce_topic(
+            self.core.native.borrow_mut().pin_mut(),
+            &topic.native,
+            partition,
+            record.key.unwrap_or_default(),
+            record.key.is_some(),
+            record.payload.unwrap_or_default(),
+            record.payload.is_some(),
+            &headers,
+            record.timestamp.unwrap_or(0),
+            record.token,
+        ))
+    }
     /// Returns bootstrap addresses of an explicitly configured native mock cluster.
     pub fn mock_bootstraps(&self) -> String {
         ffi::mock_bootstraps(&self.core.native.borrow())
+    }
+    pub(crate) fn resolve_partition(
+        &self,
+        topic: &str,
+        key: Option<&[u8]>,
+        partition: i32,
+    ) -> Result<i32> {
+        self.resolve_partition_using(&self.core.callbacks, topic, key, partition)
+    }
+    fn resolve_partition_using(
+        &self,
+        callbacks: &Rc<RefCell<crate::callbacks::Callbacks>>,
+        topic: &str,
+        key: Option<&[u8]>,
+        partition: i32,
+    ) -> Result<i32> {
+        crate::core::text(topic)?;
+        let mut partition = partition;
+        let has_partitioner = {
+            let c = callbacks.borrow();
+            c.partitioner.is_some() || c.key_partitioner.is_some()
+        };
+        if partition == PARTITION_UA && has_partitioner {
+            let cached = self.counts.borrow().get(topic).copied();
+            let count = if let Some(v) = cached {
+                v
+            } else {
+                let m = self.metadata(Some(topic), 5000)?;
+                let n = m
+                    .topics
+                    .iter()
+                    .find(|t| t.name == topic)
+                    .map_or(0, |t| t.partitions.len() as i32);
+                if n <= 0 {
+                    return Err(Error::native(3, "topic has no available partitions"));
+                }
+                self.counts.borrow_mut().insert(topic.into(), n);
+                n
+            };
+            let callback = callbacks.borrow_mut().partitioner.take();
+            if let Some(mut cb) = callback {
+                partition = cb(topic, key, count);
+                let mut c = callbacks.borrow_mut();
+                if c.partitioner.is_none() {
+                    c.partitioner = Some(cb);
+                }
+            } else {
+                let callback = callbacks.borrow_mut().key_partitioner.take();
+                if let Some(mut cb) = callback {
+                    partition = cb(topic, key, count);
+                    let mut c = callbacks.borrow_mut();
+                    if c.key_partitioner.is_none() {
+                        c.key_partitioner = Some(cb);
+                    }
+                }
+            }
+            if partition < 0 || partition >= count {
+                return Err(Error::native(
+                    -186,
+                    "partitioner returned an unavailable partition",
+                ));
+            }
+        }
+        Ok(partition)
     }
     /// Drains native callbacks on the calling thread.
     /// # Errors
@@ -214,9 +294,14 @@ impl Consumer {
     /// Returns native close or callback errors.
     pub fn close(&self) -> Result<()> {
         let _guard = self.core.begin_drive()?;
-        let code = ffi::consumer_close(self.core.native.borrow_mut().pin_mut());
-        self.core.drain(0)?;
-        status(code)
+        ffi::consumer_close_begin(self.core.native.borrow_mut().pin_mut())?;
+        loop {
+            let closed = ffi::consumer_close_poll(self.core.native.borrow_mut().pin_mut(), 100);
+            self.core.drain(0)?;
+            if closed {
+                return Ok(());
+            }
+        }
     }
 }
 macro_rules! operations {
@@ -232,11 +317,31 @@ operations!(
     commit_sync = 2,
     commit_async = 3,
     offsets_store = 4,
-    committed = 5,
-    position = 6,
-    seek = 10
+    position = 6
 );
 impl Consumer {
+    /// Queries committed offsets within the supplied timeout.
+    /// # Errors
+    /// Returns invalid timeout, native, or per-partition errors.
+    pub fn committed(
+        &self,
+        parts: &[TopicPartition],
+        timeout: std::time::Duration,
+    ) -> Result<Vec<TopicPartition>> {
+        self.core
+            .operation(5, parts, crate::core::timeout(timeout)?)
+    }
+    /// Seeks assigned partitions within the supplied timeout.
+    /// # Errors
+    /// Returns invalid timeout, native, or per-partition errors.
+    pub fn seek(
+        &self,
+        parts: &[TopicPartition],
+        timeout: std::time::Duration,
+    ) -> Result<Vec<TopicPartition>> {
+        self.core
+            .operation(10, parts, crate::core::timeout(timeout)?)
+    }
     /// Clears explicit assignment.
     /// # Errors
     /// Returns a native assignment error.

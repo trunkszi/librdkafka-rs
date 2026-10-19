@@ -8,6 +8,7 @@ use crate::{
     *,
 };
 pub struct Topic {
+    pub(crate) callbacks: Rc<RefCell<crate::callbacks::Callbacks>>,
     pub(crate) native: cxx::UniquePtr<ffi::Topic>,
     pub(crate) core: Rc<Core>,
 }
@@ -27,6 +28,7 @@ impl Topic {
     fn create(core: &Rc<Core>, name: &str, conf: &Conf) -> Result<Self> {
         crate::core::text(name)?;
         Ok(Self {
+            callbacks: Rc::clone(&conf.callbacks),
             native: ffi::topic_new(core.native.borrow_mut().pin_mut(), name, &conf.native)?,
             core: Rc::clone(core),
         })

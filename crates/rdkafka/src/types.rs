@@ -39,6 +39,10 @@ pub struct TopicPartition {
     pub partition: i32,
     pub offset: i64,
     pub error: i32,
+    /// Leader epoch when known; absent preserves native unknown-epoch semantics.
+    pub leader_epoch: Option<i32>,
+    /// Opaque broker commit metadata, preserved as bytes.
+    pub metadata: Vec<u8>,
     pub(crate) _thread: PhantomData<Rc<()>>,
 }
 impl TopicPartition {
@@ -48,6 +52,8 @@ impl TopicPartition {
             partition,
             offset,
             error: 0,
+            leader_epoch: None,
+            metadata: Vec::new(),
             _thread: PhantomData,
         }
     }

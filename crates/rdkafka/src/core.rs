@@ -11,6 +11,7 @@ pub(crate) struct Core {
     pub native: RefCell<cxx::UniquePtr<ffi::Client>>,
     pub callbacks: Rc<RefCell<Callbacks>>,
     active: Rc<Cell<bool>>,
+    pub rebalance_snapshot: RefCell<Option<(bool, String)>>,
 }
 pub(crate) struct DriveGuard {
     active: Rc<Cell<bool>>,
@@ -18,6 +19,12 @@ pub(crate) struct DriveGuard {
 impl Drop for DriveGuard {
     fn drop(&mut self) {
         self.active.set(false);
+    }
+}
+struct RebalanceScope<'a>(&'a RefCell<Option<(bool, String)>>);
+impl Drop for RebalanceScope<'_> {
+    fn drop(&mut self) {
+        self.0.borrow_mut().take();
     }
 }
 pub(crate) fn status(code: i32) -> Result<()> {
@@ -35,6 +42,8 @@ pub(crate) fn partitions(parts: &[TopicPartition]) -> Vec<ffi::NativePartition> 
             partition: p.partition,
             offset: p.offset,
             error: p.error,
+            leader_epoch: p.leader_epoch.unwrap_or(-1),
+            metadata: p.metadata.clone(),
         })
         .collect()
 }
@@ -44,6 +53,8 @@ pub(crate) fn from_parts(parts: Vec<ffi::NativePartition>) -> Vec<TopicPartition
         .map(|p| {
             let mut v = TopicPartition::new(p.topic, p.partition, p.offset);
             v.error = p.error;
+            v.leader_epoch = (p.leader_epoch >= 0).then_some(p.leader_epoch);
+            v.metadata = p.metadata;
             v
         })
         .collect()
@@ -79,6 +90,7 @@ impl Core {
             native: RefCell::new(ffi::client_new(&conf.native, kind)?),
             callbacks: Rc::clone(&conf.callbacks),
             active: Rc::clone(&conf.callbacks.borrow().active),
+            rebalance_snapshot: RefCell::default(),
         }))
     }
     pub fn begin_drive(&self) -> Result<DriveGuard> {
@@ -109,32 +121,23 @@ impl Core {
         }
         for e in events {
             if e.kind == 12 {
-                return Err(Error::native(e.code, e.message));
+                return Err(Error::Native {
+                    code: ErrorCode(e.code),
+                    message: e.message,
+                    retriable: true,
+                    fatal: false,
+                    txn_requires_abort: false,
+                });
             }
             match e.kind {
-                0 => invoke!(
-                    delivery,
-                    &DeliveryReport {
-                        topic: e.topic,
-                        partition: e.partition,
-                        offset: e.offset,
-                        token: e.token,
-                        error: (e.code != 0).then_some(ErrorCode(e.code))
-                    }
-                ),
-                1..=4 => invoke!(
-                    event,
-                    &match e.kind {
-                        2 => Event::Stats(e.message),
-                        3 => Event::Log(e.message),
-                        4 => Event::Throttle(e.message),
-                        _ => Event::Error {
-                            code: e.code,
-                            message: e.message
-                        },
-                    }
-                ),
-                5 => invoke!(rebalance, e.code, &from_parts(e.partitions)),
+                0 => invoke!(delivery, &DeliveryReport::from_native(&e)),
+                1..=4 => invoke!(event, &Event::from_native(&e)),
+                5 => {
+                    *self.rebalance_snapshot.borrow_mut() =
+                        Some((e.assignment_lost, e.rebalance_protocol));
+                    let _scope = RebalanceScope(&self.rebalance_snapshot);
+                    invoke!(rebalance, e.code, &from_parts(e.partitions));
+                }
                 6 => invoke!(commit, e.code, &from_parts(e.partitions)),
                 7 => {
                     let callback = self.callbacks.borrow_mut().oauth.take();
@@ -149,6 +152,26 @@ impl Core {
                 }
                 8 => invoke!(socket, e.code, e.partition, e.offset as i32),
                 9 => invoke!(open, &e.message, e.code, e.partition),
+                10 => {
+                    status(e.code)?;
+                    let mut headers = Headers::new();
+                    for header in e.headers {
+                        headers.add(
+                            header.name,
+                            header.has_value.then_some(header.value.as_slice()),
+                        );
+                    }
+                    self.observe(&Message {
+                        topic: e.topic,
+                        partition: e.partition,
+                        offset: e.offset,
+                        timestamp: (e.timestamp >= 0).then_some(e.timestamp),
+                        key: e.has_key.then_some(e.key),
+                        payload: e.has_payload.then_some(e.payload),
+                        headers,
+                        token: e.token,
+                    });
+                }
                 _ => {}
             }
         }
@@ -227,6 +250,11 @@ pub(crate) fn text(value: &str) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+pub(crate) fn timeout(duration: std::time::Duration) -> Result<i32> {
+    i32::try_from(duration.as_millis())
+        .map_err(|_| Error::Config("timeout exceeds native millisecond range".into()))
 }
 
 #[cfg(test)]

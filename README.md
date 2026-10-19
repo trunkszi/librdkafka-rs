@@ -22,7 +22,9 @@ fn main() -> rdkafka::Result<()> {
 
 The build needs Git, CMake, a C/C++17 toolchain, and the Rust toolchain declared in
 `rust-toolchain.toml`. It builds static Kafka, zlib, and zstd archives; lz4, snappy, and crc32c use
-Kafka's bundled implementations. OpenSSL, native curl, and asynchronous Rust runtimes are absent.
+Kafka's bundled implementations. The native Kafka build excludes OpenSSL and native curl;
+optional HTTP services use the separate rustls-backed curl transport. Asynchronous Rust runtimes
+are absent.
 
 Kafka source resolution checks `LIBRDKAFKA_DIR`, then `vendor/librdkafka`, then a verified source
 checkout in `target/vendor-cache/librdkafka`. Automatic downloads use pinned revisions. A source
@@ -50,7 +52,8 @@ bash .github/scripts/ci-incremental.sh origin/main
 ```
 
 The gate checks source size, dependency syntax, resolved dependency bans, formatting, Clippy,
-mock-broker tests, doctests, and a live Docker Redpanda round trip for all five compression modes.
+mock-broker tests, doctests, typed-record codecs and retention, real HTTP/2 TLS/OIDC,
+Schema Registry, and a live Docker Redpanda round trip for all five compression modes.
 Each live test container is scoped to that invocation and removed when it exits.
 
 To reuse an existing plaintext broker:
@@ -59,10 +62,27 @@ To reuse an existing plaintext broker:
 RDKAFKA_TEST_BROKERS=127.0.0.1:9092 bash .github/scripts/test-redpanda.sh
 ```
 
+Typed record schemas, reusable Structure-of-Arrays batches, and caller-buffer codecs
+connect directly to the native producer and consumer APIs.
 
-Synchronous, thread-affine Kafka record schemas, reusable Structure-of-Arrays
-batches, and caller-buffer binary codecs. Native broker clients are integrated
-separately from the typed-record and codec layer.
+## Transactions, administration, and batch receive
+
+Producers expose transactional initialization, begin/commit/abort, transactional
+consumer offsets, and purge. Native transaction errors retain retriable, fatal,
+and abort-required flags. `AdminClient` polls dedicated completion queues for
+resource operations and drains calling-thread observers after each request.
+
+A registered rebalance callback owns assignment changes. Apply `assign`/`unassign`
+or cooperative `incremental_assign`/`incremental_unassign` inside the callback;
+without a callback the native client applies its default assignment behavior.
+
+`produce_wire_batch` crosses the Rust/native boundary once and enqueues records
+independently with native `produceva`; per-record failures do not roll back other
+enqueues. `consume_batch` uses one native batch queue call and retains native
+receive buffers. Use `ReceivedBatch::visit_from` when failed processing must retain
+unvisited records. The convenience `consume_for_each` and `consume_views` consume
+the entire fetched batch even when a visitor fails. For manual acknowledgement,
+disable automatic offset storage and commit only successfully processed offsets.
 
 ## Typed records
 
@@ -156,13 +176,6 @@ allocation-free. Custom column types must implement `ColumnValue` accurately.
 Batches and borrowed wire/schema views are `!Send + !Sync`. Codecs are
 synchronous and invoke callbacks on the calling thread. The optional `tracing`
 feature emits payload-size diagnostics without recording payload contents.
-
-## Validation
-
-Run `bash .github/scripts/ci-incremental.sh origin/main`. Tests exercise golden
-bytes, borrow provenance, malformed input, derive diagnostics, retention,
-thread-affinity, and warmed allocation behavior. Native producer/consumer and
-live broker validation require the native-client integration.
 
 ## Calling-thread HTTP extensions
 
