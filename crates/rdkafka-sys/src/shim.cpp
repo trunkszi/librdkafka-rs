@@ -63,8 +63,8 @@ Callbacks::~Callbacks() {
 }
 void abort_pending_rebalance(State &state) {
   auto &callbacks = state.callbacks;
-  callbacks.manual_rebalance = false;
   if (!callbacks.rebalance_pending) return;
+  callbacks.manual_rebalance = false;
   callbacks.rebalance_pending = false;
   auto *raw = state.handle->c_ptr();
   // Failed Rust rebalance callbacks cannot leave native revocation pending.
