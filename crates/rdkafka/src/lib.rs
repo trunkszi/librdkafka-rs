@@ -1,17 +1,31 @@
-//! Synchronous typed records, reusable column batches, and borrowed Kafka payload codecs.
+//! Synchronous, thread-affine clients backed by statically linked librdkafka.
+mod callbacks;
+mod children;
+mod client;
+mod conf;
+mod core;
+pub mod error;
+mod received;
+mod types;
+pub use callbacks::*;
+pub use children::{Queue, Topic};
+pub use client::{Consumer, KafkaConsumer, Producer, SimpleConsumer};
+pub use conf::Conf;
+pub use error::{Error, ErrorCode, Result};
+pub use received::ReceivedMessage;
+pub use types::*;
+
 extern crate self as rdkafka;
 
 pub mod batch;
 pub mod buffer_policy;
 pub mod column;
-pub mod error;
 pub mod record;
 pub mod serde_bridge;
 pub mod wire;
 
 pub use batch::Batch;
 pub use buffer_policy::BufferPolicy;
-pub use error::{Error, Result};
 pub use rdkafka_macros::Record;
 pub use record::{Record, RecordView};
 pub use serde_bridge::SerdeBridge;

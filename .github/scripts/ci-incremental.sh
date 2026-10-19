@@ -36,6 +36,78 @@ def dependencies(value, path):
         elif isinstance(child, dict):
             dependencies(child, path)
 
+def canonical_keys(statement):
+    value = tomllib.loads(statement + '\n__ci_probe__ = true')
+    keys = []
+    while True:
+        if isinstance(value, list):
+            value = value[-1]
+        if '__ci_probe__' in value:
+            break
+        key, value = next(iter(value.items()))
+        keys.append(key)
+    return keys
+
+
+def inline_dependencies(text, path):
+    section = []
+    multiline = None
+    kinds = {'dependencies', 'dev-dependencies', 'build-dependencies'}
+    for line in text.splitlines():
+        # Ignore multiline string bodies; their text is not TOML declarations.
+        quote = None
+        assignment = None
+        code = ''
+        index = 0
+        while index < len(line):
+            if multiline:
+                if line.startswith(multiline, index):
+                    index += 3
+                    multiline = None
+                else:
+                    index += 2 if multiline == '"""' and line[index] == '\\' else 1
+                continue
+            char = line[index]
+            if quote:
+                code += char
+                if char == '\\' and quote == '"' and index + 1 < len(line):
+                    code += line[index + 1]
+                    index += 2
+                    continue
+                if char == quote:
+                    quote = None
+            elif char == '#':
+                break
+            elif line[index:index + 3] in ('"""', "'" * 3):
+                multiline = line[index:index + 3]
+                code += '""'
+                index += 3
+                continue
+            else:
+                if char in ('"', "'"):
+                    quote = char
+                elif char == '=' and assignment is None:
+                    assignment = len(code)
+                code += char
+            index += 1
+        code = code.strip()
+        if not code:
+            continue
+        if code.startswith('['):
+            section = canonical_keys(code)
+            if any(key in kinds for key in section[:-1]):
+                errors.append(f'{path}: dependency subtables must use inline-table syntax')
+        elif assignment is not None:
+            # Locate the delimiter again after leading whitespace was stripped.
+            lhs = line[:assignment].strip()
+            rhs = line[assignment + 1:].lstrip()
+            keys = canonical_keys('[' + lhs + ']')
+            location = section + keys
+            for position, key in enumerate(location):
+                if key in kinds and (len(location) != position + 2 or not rhs.startswith('{')):
+                    errors.append(f'{path}: dependencies must be direct inline-table declarations')
+
+
 for name in sorted(set(files)):
     path = pathlib.Path(name)
     if not path.is_file():
@@ -51,9 +123,7 @@ for name in sorted(set(files)):
     if name.endswith('Cargo.toml'):
         text = path.read_text()
         dependencies(tomllib.loads(text), path)
-        for line in text.splitlines():
-            if re.match(r'\s*\[.*(?:dependencies|dev-dependencies|build-dependencies)\.', line):
-                errors.append(f'{path}: dependency subtables must use inline-table syntax')
+        inline_dependencies(text, path)
     if path.name == 'Cargo.lock':
         for package in tomllib.loads(path.read_text()).get('package', []):
             if package['name'] in forbidden:
@@ -134,5 +204,8 @@ while IFS= read -r package; do
     if [ "$package" = rdkafka ]; then
       cargo test -p "$package" --features http
     fi
+  fi
+  if [ "$package" = rdkafka ]; then
+    bash .github/scripts/test-redpanda.sh
   fi
 done <<< "$selected"
