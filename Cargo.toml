@@ -1,0 +1,36 @@
+[workspace]
+members = ["crates/rdkafka", "crates/rdkafka-macros"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+rdkafka-macros = { path = "crates/rdkafka-macros" }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = { version = "0.11" }
+zerocopy = { version = "0.8", features = ["derive"] }
+thiserror = { version = "2" }
+anyhow = { version = "1" }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = { version = "1" }
+proc-macro2 = { version = "1" }
+darling = { version = "0.23" }
+heck = { version = "0.5" }
+convert_case = { version = "0.11" }
+synstructure = { version = "0.13" }
+proc-macro-crate = { version = "3" }
+trybuild = { version = "1" }
+static_assertions = { version = "1" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
