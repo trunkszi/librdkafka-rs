@@ -186,7 +186,7 @@ control HTTP version negotiation, `TCP_NODELAY`, connection reuse, and
 multiplexing. Requests have positive deadlines and bounded response bodies and
 headers; synchronous DNS resolution precedes the transfer deadline.
 
-`TlsSettings` is shared with the broker transport. The standalone `tls` feature
+`TlsSettings` configures HTTP trust and identity. The standalone `tls` feature
 exposes its verified `build_client_config()` helper without enabling HTTP.
 Custom CA PEM, native trust roots, verified SNI override, and client identity
 must agree with curl's TLS options. Unverified TLS is rejected. Linux HTTP mTLS
@@ -196,7 +196,7 @@ Other platforms reject HTTP mTLS until equivalent backing is provided.
 
 OAuth client-credentials refresh runs synchronously and reports success or
 failure through `OAuthBearerTokenSetter`. Native poll callbacks can call
-`refresh` with their token setter. Configure the native principal and extensions
+`refresh` through an application-provided token-setter adapter. Configure the native principal and extensions
 explicitly. HTTPS is required by default; cleartext loopback endpoints require
 explicit opt-in for local development. Errors and Debug output omit access
 tokens, client secrets, and server response bodies.
