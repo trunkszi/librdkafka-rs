@@ -201,3 +201,20 @@ fn integration_lifecycle_manual_rebalance_close_has_bounded_fallback() {
     drop(consumer);
     assert!(begin.elapsed() < Duration::from_secs(7));
 }
+
+#[test]
+fn integration_scenario_partitioners_reject_nonpositive_partition_counts() {
+    let mut producer = mock_producer();
+    let conf = ffi::conf_new(true);
+    let topic =
+        ffi::topic_new(producer.pin_mut(), "invalid-partition-count", &conf).expect("native topic");
+    for key in [b"".as_slice(), b"key".as_slice()] {
+        for count in [0, -1, i32::MIN] {
+            assert_eq!(ffi::topic_murmur2_partition(&topic, key, count), -1);
+        }
+        for count in [1, 3] {
+            let partition = ffi::topic_murmur2_partition(&topic, key, count);
+            assert!((0..count).contains(&partition));
+        }
+    }
+}

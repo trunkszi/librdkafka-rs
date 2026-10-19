@@ -366,3 +366,39 @@ fn integration_lifecycle_scenario_native_close_releases_pending_plaintext() {
     release_tx.send(()).unwrap();
     server.join().unwrap().unwrap();
 }
+
+#[test]
+fn unit_scenario_interrupted_wait_returns_to_absolute_deadline() {
+    let mut descriptors = [libc::pollfd {
+        fd: -1,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    let deadline_ms = 20;
+    let mut elapsed_ms = 0;
+    let mut requested_timeouts = Vec::new();
+    while elapsed_ms < deadline_ms {
+        wait_with(
+            &mut descriptors,
+            deadline_ms - elapsed_ms,
+            |fds, timeout| {
+                requested_timeouts.push(timeout);
+                elapsed_ms += 5;
+                // Interrupted poll must not leave stale readiness for the caller.
+                fds[0].revents = libc::POLLIN;
+                Err(io::ErrorKind::Interrupted.into())
+            },
+        )
+        .unwrap();
+        assert_eq!(descriptors[0].revents, 0);
+    }
+    assert_eq!(requested_timeouts, [20, 15, 10, 5]);
+    assert_eq!(elapsed_ms, deadline_ms);
+    let error = wait_with(&mut descriptors, 0, |_, _| Ok(0)).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    let error = wait_with(&mut descriptors, -1, |_, _| {
+        Err(io::ErrorKind::BrokenPipe.into())
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+}

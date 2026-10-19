@@ -227,6 +227,7 @@ int32_t Callbacks::partitioner_cb(const RdKafka::Topic *t,
 }
 int32_t Callbacks::partitioner_cb(const RdKafka::Topic *t, const void *key,
                                   size_t len, int32_t n, void *) {
+  if (n <= 0) return RD_KAFKA_PARTITION_UA;
   return rd_kafka_msg_partitioner_consistent_random(
       const_cast<RdKafka::Topic *>(t)->c_ptr(), key, len, n, nullptr, nullptr);
 }
@@ -255,6 +256,14 @@ static int fallback_open(const std::string &path, int flags, int mode) {
 }
 bool native_callback_contract_test() {
   Callbacks callbacks;
+  for (int32_t count : {0, -1, INT32_MIN}) {
+    if (callbacks.partitioner_cb(nullptr, static_cast<const std::string *>(nullptr),
+                                  count, nullptr) != RD_KAFKA_PARTITION_UA ||
+        callbacks.partitioner_cb(nullptr, nullptr, 0, count, nullptr) != RD_KAFKA_PARTITION_UA ||
+        partitioner_pointer(nullptr, nullptr, 0, count, &callbacks, nullptr) != RD_KAFKA_PARTITION_UA ||
+        partitioner_string(nullptr, nullptr, 0, count, &callbacks, nullptr) != RD_KAFKA_PARTITION_UA)
+      return false;
+  }
   for (int kind : {0, 1, 5, 6, 7, 10, 13})
     for (uint64_t i = 0; i < 5000; ++i)
       callbacks.record(kind, 0, "", "", -1, -1, i);
@@ -338,12 +347,14 @@ public:
 };
 int32_t partitioner_pointer(const rd_kafka_topic_t *topic, const void *key,
                             size_t len, int32_t n, void *opaque, void *token) {
+  if (n <= 0) return RD_KAFKA_PARTITION_UA;
   BorrowedTopic borrowed(topic);
   return static_cast<Callbacks *>(opaque)->partitioner_cb(&borrowed, key, len,
                                                           n, token);
 }
 int32_t partitioner_string(const rd_kafka_topic_t *topic, const void *key,
                            size_t len, int32_t n, void *opaque, void *token) {
+  if (n <= 0) return RD_KAFKA_PARTITION_UA;
   BorrowedTopic borrowed(topic);
   std::string text;
   if (key)

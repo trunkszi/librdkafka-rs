@@ -257,6 +257,7 @@ std::unique_ptr<Topic> topic_new(Client &c, rust::Str name, const Conf &conf) {
 }
 int32_t topic_murmur2_partition(const Topic &t, rust::Slice<const uint8_t> key,
                                  int32_t count) {
+  if (count <= 0) return RD_KAFKA_PARTITION_UA;
   return rd_kafka_msg_partitioner_murmur2_random(t.value, key.data(), key.size(),
                                                 count, nullptr, nullptr);
 }

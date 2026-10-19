@@ -121,7 +121,7 @@ fn unit_scenario_tls_failure_preserves_remaining_callback_order() {
 }
 
 #[test]
-fn unit_scenario_tls_supersedes_prior_callback_errors_without_dropping_events() {
+fn unit_scenario_first_callback_error_survives_later_tls_without_dropping_events() {
     for kind in [7, 10, 12] {
         let core = core();
         core.callbacks.borrow_mut().oauth =
@@ -139,7 +139,13 @@ fn unit_scenario_tls_supersedes_prior_callback_errors_without_dropping_events() 
             event(13, "TLS failure"),
             event(0, ""),
         ]);
-        assert!(matches!(result, Err(Error::Tls(message)) if message == "TLS failure"));
+        match kind {
+            7 => assert!(
+                matches!(result, Err(Error::Config(message)) if message == "refresh failed")
+            ),
+            10 | 12 => assert!(matches!(result, Err(Error::Native { .. }))),
+            _ => unreachable!(),
+        }
         assert_eq!(deliveries.get(), 2);
     }
 }
@@ -430,4 +436,95 @@ fn integration_scenario_receive_observer_failures_are_drained_and_deferred_same_
         }
     }
     Ok(())
+}
+
+#[test]
+fn unit_scenario_tls_error_survives_panicking_error_observer() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let core = core();
+    core.callbacks.borrow_mut().event = Some(Box::new(|_| panic!("error observer")));
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            core.dispatch(vec![event(13, "certificate rejected"), event(0, "")])
+        }))
+        .is_err()
+    );
+    assert!(matches!(core.poll(0), Err(Error::Tls(message)) if message == "certificate rejected"));
+    assert!(!core.active.get());
+    let delivered = Rc::new(Cell::new(0));
+    let seen = Rc::clone(&delivered);
+    core.callbacks.borrow_mut().delivery = Some(Box::new(move |_| seen.set(seen.get() + 1)));
+    core.dispatch(Vec::new()).unwrap();
+    assert_eq!(delivered.get(), 1);
+    assert!(core.take_pending_error().is_ok());
+}
+
+#[test]
+fn unit_scenario_callback_failure_survives_later_observer_unwind() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let core = core();
+    core.callbacks.borrow_mut().oauth = Some(Box::new(|_| {
+        Err(Error::Config("first refresh failed".into()))
+    }));
+    core.callbacks.borrow_mut().delivery = Some(Box::new(|_| panic!("delivery observer")));
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            core.dispatch(vec![event(7, "refresh"), event(0, "")])
+        }))
+        .is_err()
+    );
+    assert!(
+        matches!(core.poll(0), Err(Error::Config(message)) if message == "first refresh failed")
+    );
+    assert!(core.take_pending_error().is_ok());
+}
+
+#[test]
+fn unit_scenario_pending_error_survives_receive_observer_and_later_tls_unwind() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let core = core();
+    *core.pending_error.borrow_mut() = Some(Error::Config("first pending failure".into()));
+    core.callbacks.borrow_mut().consume = Some(Box::new(|_| panic!("consume observer")));
+    let message = Message {
+        topic: "orders".into(),
+        partition: 0,
+        offset: 42,
+        timestamp: None,
+        key: None,
+        payload: None,
+        headers: Headers::new(),
+        token: 0,
+    };
+    assert!(catch_unwind(AssertUnwindSafe(|| core.observe(&message))).is_err());
+    core.callbacks.borrow_mut().event = Some(Box::new(|_| panic!("TLS observer")));
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            core.dispatch(vec![event(13, "later TLS failure")])
+        }))
+        .is_err()
+    );
+    assert!(
+        matches!(core.poll(0), Err(Error::Config(message)) if message == "first pending failure")
+    );
+    assert!(core.take_pending_error().is_ok());
+}
+
+#[test]
+fn unit_scenario_first_oauth_failure_survives_later_tls_observer_panic() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let core = core();
+    core.callbacks.borrow_mut().oauth = Some(Box::new(|_| {
+        Err(Error::Config("first refresh failed".into()))
+    }));
+    core.callbacks.borrow_mut().event = Some(Box::new(|_| panic!("TLS observer")));
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            core.dispatch(vec![event(7, "refresh"), event(13, "later TLS failure")])
+        }))
+        .is_err()
+    );
+    assert!(
+        matches!(core.poll(0), Err(Error::Config(message)) if message == "first refresh failed")
+    );
+    assert!(core.take_pending_error().is_ok());
 }
