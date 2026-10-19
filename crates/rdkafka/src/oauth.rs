@@ -85,9 +85,14 @@ impl OAuthBearerHttpClient {
     /// Obtain a token and validate its lifetime before returning it.
     ///
     /// # Errors
-    /// Rejects transport failures, non-success responses, invalid JSON, and expired tokens.
+    /// Rejects invalid local token metadata before HTTP, transport failures,
+    /// non-success responses, invalid JSON, and expired tokens.
     pub fn request_token(&mut self) -> Result<OAuthBearerToken> {
         validate_endpoint(&self.config)?;
+        if self.config.principal.chars().any(char::is_control) {
+            return Err(oauth_error("invalid principal"));
+        }
+        validate_extensions(&self.config.extensions)?;
         let started = unix_millis()?;
         let mut request = HttpRequest::new("POST", &self.config.token_endpoint);
         request.headers.push((
@@ -124,6 +129,7 @@ impl OAuthBearerHttpClient {
             .to_owned();
         if value
             .get("token_type")
+            .filter(|value| !value.is_null())
             .is_some_and(|v| !v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("bearer")))
         {
             return Err(oauth_error("unsupported token type"));
@@ -142,7 +148,7 @@ impl OAuthBearerHttpClient {
         if expires_at_ms <= unix_millis()? {
             return Err(oauth_error("token expired during refresh"));
         }
-        let scope = match value.get("scope") {
+        let scope = match value.get("scope").filter(|value| !value.is_null()) {
             None => self.config.scope.clone(),
             Some(v) => v
                 .as_str()
@@ -152,7 +158,7 @@ impl OAuthBearerHttpClient {
                 .collect(),
         };
         let mut extensions = self.config.extensions.clone();
-        if let Some(extra) = value.get("extensions") {
+        if let Some(extra) = value.get("extensions").filter(|value| !value.is_null()) {
             for (key, value) in extra
                 .as_object()
                 .ok_or_else(|| oauth_error("invalid token extensions"))?
@@ -166,17 +172,7 @@ impl OAuthBearerHttpClient {
                 );
             }
         }
-        if extensions.iter().any(|(k, v)| {
-            k.is_empty()
-                || k == "auth"
-                || !k.bytes().all(|c| c.is_ascii_alphabetic())
-                || v.chars().any(char::is_control)
-        }) {
-            return Err(oauth_error("invalid SASL extension"));
-        }
-        if self.config.principal.chars().any(char::is_control) {
-            return Err(oauth_error("invalid principal"));
-        }
+        validate_extensions(&extensions)?;
         if expires_at_ms <= unix_millis()? {
             return Err(oauth_error("token expired during validation"));
         }
@@ -192,18 +188,53 @@ impl OAuthBearerHttpClient {
     ///
     /// # Errors
     /// Returns refresh or installation failures after notifying the native client.
+    /// If notification also fails, retains both sanitized failure summaries.
     pub fn refresh(&mut self, target: &mut impl OAuthBearerTokenSetter) -> Result<()> {
         let result = self.request_token().and_then(|token| {
-            target
-                .oauthbearer_set_token(&token)
-                .map_err(|_| oauth_error("token installation failed"))
+            target.oauthbearer_set_token(&token).map_err(|error| {
+                oauth_error(&format!(
+                    "token installation failed ({})",
+                    failure_category(&error)
+                ))
+            })
         });
-        if result.is_err() {
-            target
-                .oauthbearer_set_token_failure("OAuth bearer refresh failed")
-                .map_err(|_| oauth_error("token failure notification failed"))?;
+        match result {
+            Ok(()) => Ok(()),
+            Err(primary) => {
+                if let Err(fallback) =
+                    target.oauthbearer_set_token_failure("OAuth bearer refresh failed")
+                {
+                    return Err(oauth_error(&format!(
+                        "{primary}; token failure notification failed ({})",
+                        failure_category(&fallback)
+                    )));
+                }
+                Err(primary)
+            }
         }
-        result
+    }
+}
+fn validate_extensions(extensions: &BTreeMap<String, String>) -> Result<()> {
+    if extensions.iter().any(|(key, value)| {
+        key.is_empty()
+            || key == "auth"
+            || !key.bytes().all(|byte| byte.is_ascii_alphabetic())
+            || value.chars().any(char::is_control)
+    }) {
+        return Err(oauth_error("invalid SASL extension"));
+    }
+    Ok(())
+}
+// Setter errors may contain credentials supplied by the token or native client.
+fn failure_category(error: &Error) -> &'static str {
+    match error {
+        Error::Native { .. } => "native error",
+        Error::Config(_) => "configuration error",
+        Error::Http(_) => "HTTP error",
+        Error::Tls(_) => "TLS error",
+        Error::OAuth(_) => "OAuth error",
+        Error::Callback(_) => "callback error",
+        _ => "client error",
     }
 }
 fn oauth_error(message: &str) -> Error {

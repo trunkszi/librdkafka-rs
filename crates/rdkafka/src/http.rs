@@ -59,6 +59,7 @@ pub struct HttpRequest {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     /// Positive overall curl transfer deadline, rounded up to milliseconds.
+    /// Values above `i32::MAX` milliseconds are rejected before DNS resolution.
     pub timeout: Duration,
     /// Maximum response body size, independently of the 64 KiB header limit.
     pub max_response_bytes: usize,
@@ -92,6 +93,7 @@ pub struct HttpResponse {
 ///
 /// DNS resolution uses the calling thread's platform resolver before the curl
 /// transfer deadline starts. TLS peer and hostname verification are mandatory.
+/// A TLS server-name override uses a fresh connection for each request.
 /// HTTP mutual TLS uses sealed anonymous RAM files on Linux; other platforms
 /// reject client identities without writing credentials to disk.
 pub struct HttpTransport {
@@ -157,6 +159,10 @@ impl HttpTransport {
     /// TLS verification failure, or response headers/body exceeding their limits.
     pub fn execute(&mut self, request: HttpRequest) -> Result<HttpResponse> {
         let mut easy = self.configured_easy(&request)?;
+        let secure = url::Url::parse(&request.url)
+            .map_err(|_| Error::Http("invalid HTTP URL".into()))?
+            .scheme()
+            == "https";
         let response = Rc::new(RefCell::new(HttpResponse {
             status: 0,
             headers: Vec::new(),
@@ -207,7 +213,11 @@ impl HttpTransport {
                 if line.starts_with("HTTP/") {
                     response.headers.clear();
                     response.version = if line.starts_with("HTTP/2") {
-                        Some(HttpVersionChoice::Http2Tls)
+                        Some(if secure {
+                            HttpVersionChoice::Http2Tls
+                        } else {
+                            HttpVersionChoice::Http2PriorKnowledge
+                        })
                     } else if line.starts_with("HTTP/1.") {
                         Some(HttpVersionChoice::Http1)
                     } else {
@@ -271,9 +281,7 @@ impl HttpTransport {
     }
 
     fn configured_easy(&self, request: &HttpRequest) -> Result<Easy> {
-        if request.timeout.is_zero() {
-            return Err(Error::Http("HTTP timeout must be positive".into()));
-        }
+        let timeout = transfer_timeout(request.timeout)?;
         if request.method.is_empty() || !request.method.bytes().all(is_token) {
             return Err(Error::Http("invalid HTTP method".into()));
         }
@@ -298,10 +306,14 @@ impl HttpTransport {
             .ok_or_else(|| Error::Http("HTTP URL has no port".into()))?;
         let original_authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
         let original_authority = original_authority.to_owned();
-        if url.scheme() == "https"
-            && let Some(name) = &self.tls.server_name
-        {
-            url.set_host(Some(name))
+        let rewritten_host = url.scheme() == "https" && self.tls.server_name.is_some();
+        if rewritten_host && let Some(name) = &self.tls.server_name {
+            let host = if name.parse::<std::net::Ipv6Addr>().is_ok() {
+                format!("[{name}]")
+            } else {
+                name.clone()
+            };
+            url.set_host(Some(&host))
                 .map_err(|_| Error::Tls("invalid TLS server name".into()))?;
         }
         let mut easy = Easy::new();
@@ -327,16 +339,15 @@ impl HttpTransport {
             .map_err(curl_error)?;
         easy.tcp_keepalive(self.preferences.keep_alive)
             .map_err(curl_error)?;
-        easy.forbid_reuse(!self.preferences.keep_alive)
-            .map_err(curl_error)?;
-        easy.fresh_connect(!self.preferences.keep_alive)
-            .map_err(curl_error)?;
+        // Curl keys its connection cache by the rewritten TLS authority.
+        // An override must not reuse a socket belonging to another original origin.
+        let fresh_connection = rewritten_host || !self.preferences.keep_alive;
+        easy.forbid_reuse(fresh_connection).map_err(curl_error)?;
+        easy.fresh_connect(fresh_connection).map_err(curl_error)?;
         easy.pipewait(self.preferences.multiplex)
             .map_err(curl_error)?;
-        let millis = request.timeout.as_millis().max(1).min(u128::from(u64::MAX)) as u64;
-        easy.timeout(Duration::from_millis(millis))
-            .map_err(curl_error)?;
-        easy.connect_timeout(Duration::from_millis(millis).min(Duration::from_secs(10)))
+        easy.timeout(timeout).map_err(curl_error)?;
+        easy.connect_timeout(timeout.min(Duration::from_secs(10)))
             .map_err(curl_error)?;
         easy.ssl_verify_peer(true).map_err(curl_error)?;
         easy.ssl_verify_host(true).map_err(curl_error)?;
@@ -349,7 +360,12 @@ impl HttpTransport {
         self.identity.configure(&mut easy)?;
         let mut headers = List::new();
         headers.append("Expect:").map_err(curl_error)?;
-        if self.tls.server_name.is_some() && url.scheme() == "https" {
+        if rewritten_host
+            && !request
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("Host"))
+        {
             headers
                 .append(&format!("Host: {original_authority}"))
                 .map_err(curl_error)?;
@@ -409,5 +425,59 @@ fn event_error(error: curl::event_loop::Error) -> Error {
             Error::Http(format!("HTTP transport I/O failed: {:?}", error.kind()))
         }
         _ => Error::Http("HTTP event-loop operation failed".into()),
+    }
+}
+
+fn transfer_timeout(timeout: Duration) -> Result<Duration> {
+    if timeout.is_zero() {
+        return Err(Error::Http("HTTP timeout must be positive".into()));
+    }
+    if timeout > Duration::from_millis(i32::MAX as u64) {
+        return Err(Error::Http(
+            "HTTP timeout exceeds maximum supported milliseconds".into(),
+        ));
+    }
+    let millis = timeout.as_nanos().div_ceil(1_000_000) as u64;
+    Ok(Duration::from_millis(millis))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_scenario_ipv6_tls_name_is_a_valid_url_host() {
+        let transport = HttpTransport::new(TlsSettings::default().with_server_name("::1")).unwrap();
+        let easy = transport
+            .configured_easy(&HttpRequest::new("GET", "https://127.0.0.1:1/"))
+            .unwrap();
+        assert_eq!(easy.effective_url().unwrap(), Some("https://[::1]:1/"));
+    }
+
+    #[test]
+    fn unit_scenario_positive_submillisecond_timeouts_remain_bounded() {
+        for micros in [1, 500, 999] {
+            assert_eq!(
+                transfer_timeout(Duration::from_micros(micros)).unwrap(),
+                Duration::from_millis(1)
+            );
+        }
+        assert_eq!(
+            transfer_timeout(Duration::from_nanos(1)).unwrap(),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn unit_scenario_timeout_bounds_are_checked_without_overflow() {
+        let maximum = Duration::from_millis(i32::MAX as u64);
+        assert_eq!(transfer_timeout(maximum).unwrap(), maximum);
+        for timeout in [
+            Duration::ZERO,
+            maximum + Duration::from_nanos(1),
+            Duration::MAX,
+        ] {
+            assert!(matches!(transfer_timeout(timeout), Err(Error::Http(_))));
+        }
     }
 }

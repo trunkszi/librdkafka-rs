@@ -59,16 +59,34 @@ impl<T: ColumnValue> ColumnValue for Vec<T> {
         )
     }
     fn clear_value(&mut self, retention: Retention) {
+        let total_target = retention.target(self.extra_bytes());
         let target = retention.target(if size_of::<T>() == 0 {
             0
         } else {
             self.capacity()
         });
-        self.truncate(target);
-        for value in self.iter_mut() {
-            value.clear_value(retention);
+        let nested_bytes = self.iter().fold(0usize, |bytes, value| {
+            bytes.saturating_add(value.extra_bytes())
+        });
+        if nested_bytes == 0 {
+            self.clear();
+            self.shrink_to(target);
+            return;
         }
+        self.truncate(target);
         self.shrink_to(target);
+        let remaining = total_target.saturating_sub(self.capacity().saturating_mul(size_of::<T>()));
+        let retained_nested = self.iter().fold(0usize, |bytes, value| {
+            bytes.saturating_add(value.extra_bytes())
+        });
+        let child = crate::BufferPolicy {
+            max_records: usize::MAX,
+            max_bytes: remaining,
+        }
+        .retention(0, retained_nested, 0);
+        for value in self.iter_mut() {
+            value.clear_value(child);
+        }
     }
     fn shrink_value(&mut self) {
         for value in self.iter_mut() {
@@ -151,7 +169,18 @@ impl<T: Clone + ColumnValue> ReusableColumn<T> {
     pub fn as_slice(&self) -> &[T] {
         &self.values[..self.len]
     }
+    /// Reduce the visible length, retaining initialized slots and their allocations.
+    ///
+    /// A length at least as large as the current length has no effect. Hidden
+    /// values are reused by subsequent appends; truncation never drops values
+    /// or invokes their cloning or cleanup methods.
+    pub fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
     /// Update a retained slot or create a value only when no slot exists.
+    /// # Panics
+    /// Panics if field creation, cloning, or updating panics, or vector growth exceeds its size
+    /// limit.
     pub fn push_with(&mut self, create: impl FnOnce() -> T, update: impl FnOnce(&mut T)) {
         if let Some(slot) = self.values.get_mut(self.len) {
             update(slot);
@@ -165,6 +194,9 @@ impl<T: Clone + ColumnValue> ReusableColumn<T> {
         MemoryBuffer::shrink_to_fit(self);
     }
     /// Move a newly decoded value into a cold slot, reusing a warm slot if present.
+    /// # Panics
+    /// Panics if field creation, cloning, or updating panics, or vector growth exceeds its size
+    /// limit.
     pub fn push_owned(&mut self, value: T) {
         if let Some(slot) = self.values.get_mut(self.len) {
             slot.clone_from(&value);
@@ -174,6 +206,9 @@ impl<T: Clone + ColumnValue> ReusableColumn<T> {
         self.len += 1;
     }
     /// Copy into an existing initialized slot, or append a new slot.
+    /// # Panics
+    /// Panics if field creation, cloning, or updating panics, or vector growth exceeds its size
+    /// limit.
     pub fn push(&mut self, value: &T) {
         if let Some(slot) = self.values.get_mut(self.len) {
             slot.clone_from(value);
@@ -303,10 +338,11 @@ where
             },
         )
     }
-    fn clear_value(&mut self, _retention: Retention) {
+    fn clear_value(&mut self, retention: Retention) {
         // Map entries cannot retain cleared keys without changing lookup identity.
+        let target = retention.target(self.capacity());
         self.clear();
-        self.shrink_to_fit();
+        self.shrink_to(target);
     }
     fn shrink_value(&mut self) {
         for value in self.values_mut() {

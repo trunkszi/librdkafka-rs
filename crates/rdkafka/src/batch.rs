@@ -29,13 +29,19 @@ pub trait Batch: Default {
     /// Release unused capacity without discarding records.
     fn shrink_to_fit(&mut self);
     /// Append one owned record's fields to the columns.
+    /// # Panics
+    /// Panics for inconsistent column lengths, a panicking field clone, or vector size overflow.
     fn push(&mut self, record: &Self::Record);
     /// Append a borrowed projection to the columns after validating its fields.
     /// # Errors
     /// Returns an error if a projected collection cannot be decoded. No columns
     /// are appended until all fallible field decoding succeeds.
+    /// # Panics
+    /// Panics if cloning a field panics or column growth exceeds the vector size limit.
     fn push_ref<'a>(&mut self, record: <Self::Record as Record>::View<'a>) -> Result<()>;
     /// Append records from a slice.
+    /// # Panics
+    /// Panics when an individual append panics; preceding records remain appended.
     fn extend_from_slice(&mut self, records: &[Self::Record]) {
         for record in records {
             self.push(record);

@@ -79,7 +79,7 @@ def inline_dependencies(text, path):
                 if char in ('"', "'"):
                     quote = char
                 elif char == '=' and assignment is None:
-                    assignment = len(code)
+                    assignment = index
                 code += char
             index += 1
         code = code.strip()

@@ -76,7 +76,10 @@ impl<'de, T: BorrowDecode<'de>> EncodedSequence<'de, T> {
         for _ in 0..len {
             T::borrow_decode(&mut cursor)?;
         }
-        let consumed = contents.len() - cursor.input.len();
+        let consumed = contents
+            .len()
+            .checked_sub(cursor.input.len())
+            .ok_or_else(|| Error::Codec("sequence decoder replaced the input cursor".into()))?;
         cursor.depth -= 1;
         let sequence = Self {
             bytes: &contents[..consumed],

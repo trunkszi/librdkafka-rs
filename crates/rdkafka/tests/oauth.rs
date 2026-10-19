@@ -117,3 +117,114 @@ fn integration_scenario_native_installation_rejection_notifies_failure() {
     assert!(target.0);
     server.join().unwrap();
 }
+
+#[test]
+fn integration_scenario_double_failure_preserves_sanitized_causes() {
+    struct RejectBoth;
+    impl OAuthBearerTokenSetter for RejectBoth {
+        fn oauthbearer_set_token(&mut self, _: &OAuthBearerToken) -> Result<()> {
+            Err(rdkafka::Error::Config(
+                "access-token client-secret server-body".into(),
+            ))
+        }
+        fn oauthbearer_set_token_failure(&mut self, reason: &str) -> Result<()> {
+            assert_eq!(reason, "OAuth bearer refresh failed");
+            Err(rdkafka::Error::Http(
+                "access-token client-secret server-body".into(),
+            ))
+        }
+    }
+    for (status, body, primary) in [
+        (
+            401,
+            "access-token client-secret server-body",
+            "token endpoint rejected request",
+        ),
+        (
+            200,
+            r#"{"access_token":"access-token","expires_in":3600}"#,
+            "token installation failed (configuration error)",
+        ),
+    ] {
+        let (url, server) = http_server::serve(vec![(status, body.into())]);
+        let mut config = OAuthBearerConfig::new(url, "id", "client-secret");
+        config.allow_insecure_loopback_http = true;
+        let mut client =
+            OAuthBearerHttpClient::new(HttpTransport::new(TlsSettings::default()).unwrap(), config);
+        let error = client.refresh(&mut RejectBoth).unwrap_err();
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(rendered.contains(primary), "{rendered}");
+            assert!(rendered.contains("token failure notification failed (HTTP error)"));
+            for secret in ["access-token", "client-secret", "server-body"] {
+                assert!(!rendered.contains(secret));
+            }
+        }
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn integration_scenario_invalid_local_metadata_fails_before_http() {
+    let (url, server) = http_server::serve(vec![(
+        200,
+        r#"{"access_token":"valid-token","expires_in":3600}"#.into(),
+    )]);
+    for (principal, key, value, expected) in [
+        ("user\0secret", "tenant", "valid", "invalid principal"),
+        ("user\nsecret", "tenant", "valid", "invalid principal"),
+        ("", "", "valid", "invalid SASL extension"),
+        ("", "auth", "valid", "invalid SASL extension"),
+        ("", "tenant=other", "valid", "invalid SASL extension"),
+        ("", "tenant\u{1}other", "valid", "invalid SASL extension"),
+        ("", "tenant", "value\0secret", "invalid SASL extension"),
+        (
+            "",
+            "tenant",
+            "value\u{1}auth=secret",
+            "invalid SASL extension",
+        ),
+    ] {
+        let mut config = OAuthBearerConfig::new(&url, "client", "secret");
+        config.allow_insecure_loopback_http = true;
+        config.principal = principal.into();
+        config.extensions.insert(key.into(), value.into());
+        let mut client =
+            OAuthBearerHttpClient::new(HttpTransport::new(TlsSettings::default()).unwrap(), config);
+        assert!(
+            client
+                .request_token()
+                .unwrap_err()
+                .to_string()
+                .contains(expected)
+        );
+    }
+    let mut config = OAuthBearerConfig::new(&url, "client", "secret");
+    config.allow_insecure_loopback_http = true;
+    let mut client =
+        OAuthBearerHttpClient::new(HttpTransport::new(TlsSettings::default()).unwrap(), config);
+    assert_eq!(client.request_token().unwrap().access_token, "valid-token");
+    assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[test]
+fn integration_scenario_null_optional_fields_preserve_configured_defaults() {
+    let (url, server) = http_server::serve(vec![(
+        200, r#"{"access_token":"valid-token","expires_in":3600,"token_type":null,"scope":null,"extensions":null}"#.into(),
+    )]);
+    let mut config = OAuthBearerConfig::new(url, "client", "secret");
+    config.allow_insecure_loopback_http = true;
+    config.scope = vec!["read".into()];
+    config
+        .extensions
+        .insert("tenant".into(), "configured".into());
+    let mut client =
+        OAuthBearerHttpClient::new(HttpTransport::new(TlsSettings::default()).unwrap(), config);
+    let token = client.request_token().unwrap();
+    assert_eq!(token.scope, ["read"]);
+    assert_eq!(
+        token.extensions.get("tenant").map(String::as_str),
+        Some("configured")
+    );
+    assert!(token.principal.is_empty());
+    server.join().unwrap();
+}
