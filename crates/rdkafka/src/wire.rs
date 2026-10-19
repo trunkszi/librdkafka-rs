@@ -275,13 +275,17 @@ impl WireBatch {
     }
     /// Clear lengths and apply one aggregate record and byte retention budget.
     pub fn clear_with_policy(&mut self, policy: BufferPolicy) {
-        let retention = policy.retention(self.capacity(), self.allocated_bytes());
+        let retention = policy.retention(
+            self.capacity(),
+            self.allocated_bytes(),
+            self.records.allocated_bytes(),
+        );
         self.records.clear_retained(retention);
-        self.headers.clear_retained(retention);
-        self.topics.clear_retained(retention);
-        self.keys.clear_retained(retention);
-        self.payloads.clear_retained(retention);
-        self.header_bytes.clear_retained(retention);
+        clear_arena(&mut self.headers, retention);
+        clear_arena(&mut self.topics, retention);
+        clear_arena(&mut self.keys, retention);
+        clear_arena(&mut self.payloads, retention);
+        clear_arena(&mut self.header_bytes, retention);
     }
     /// Release unused capacity while retaining records.
     pub fn shrink_to_fit(&mut self) {
@@ -488,4 +492,10 @@ fn encode_range(
         return Err(Error::Codec("encoder shortened arena prefix".into()));
     }
     Ok(start..destination.len())
+}
+
+fn clear_arena<T>(arena: &mut Vec<T>, retention: crate::buffer_policy::Retention) {
+    let target = retention.target(arena.capacity());
+    arena.clear();
+    arena.shrink_to(target);
 }

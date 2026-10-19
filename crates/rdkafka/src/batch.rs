@@ -45,4 +45,10 @@ pub trait Batch: Default {
     /// # Errors
     /// Returns an error for inconsistent column lengths or invalid fields.
     fn to_wire_batch(&self) -> Result<WireBatch>;
+    /// Decode all wire frames into a new typed column batch.
+    /// # Errors
+    /// Returns an error if any wire record violates the schema.
+    fn from_wire_batch(wire: &WireBatch) -> Result<Self>
+    where
+        Self: Sized;
 }

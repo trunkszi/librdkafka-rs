@@ -3,6 +3,21 @@
 /// A rejected record layout, codec input, or batch shape.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// HTTP request setup, transport, or response validation failed.
+    #[error("http: {0}")]
+    Http(String),
+    /// TLS trust, identity, or handshake validation failed.
+    #[error("tls: {0}")]
+    Tls(String),
+    /// An OAuth token refresh failed closed.
+    #[error("oauth: {0}")]
+    OAuth(String),
+    /// A schema registry request or wire frame was rejected.
+    #[error("schema registry: {0}")]
+    SchemaRegistry(String),
+    /// Calling-thread slot construction, leasing, or lifecycle failed.
+    #[error("worker: {0}")]
+    Worker(String),
     /// A caller-provided codec or observer rejected the operation.
     #[error(transparent)]
     Callback(#[from] anyhow::Error),

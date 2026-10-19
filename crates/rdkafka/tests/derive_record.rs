@@ -213,3 +213,134 @@ fn integration_scenario_collection_metadata_and_optional_bytes() {
     batch.push_ref(view).unwrap();
     assert_eq!(batch.column_ids(), &[vec![7, 9]]);
 }
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Record)]
+struct Detail {
+    label: String,
+    bytes: Vec<u8>,
+}
+#[derive(Debug, PartialEq, Record)]
+struct CompositeColumns {
+    detail: Detail,
+    tuple: (String, Vec<u8>),
+    labels: std::collections::BTreeMap<String, String>,
+}
+#[test]
+fn integration_scenario_nested_record_tuple_and_map_columns_account_allocations() {
+    let record = CompositeColumns {
+        detail: Detail {
+            label: "nested".repeat(32),
+            bytes: vec![7; 128],
+        },
+        tuple: ("tuple".repeat(16), vec![8; 64]),
+        labels: [("key".into(), "value".repeat(32))].into_iter().collect(),
+    };
+    let mut batch = CompositeColumnsBatch::with_capacity(1);
+    batch.push(&record);
+    let extra = rdkafka::column::ColumnValue::extra_bytes(&record);
+    assert!(
+        extra
+            >= record.detail.label.capacity()
+                + record.detail.bytes.capacity()
+                + record.tuple.0.capacity()
+                + record.tuple.1.capacity()
+                + record.labels.values().map(String::capacity).sum::<usize>()
+    );
+    assert!(batch.allocated_bytes() >= extra);
+    let wire = batch.to_wire_batch().unwrap();
+    let decoded = <CompositeColumnsBatch as rdkafka::Batch>::from_wire_batch(&wire).unwrap();
+    assert_eq!(
+        decoded.column_detail(),
+        std::slice::from_ref(&record.detail)
+    );
+    assert_eq!(decoded.column_tuple(), std::slice::from_ref(&record.tuple));
+    assert_eq!(
+        decoded.column_labels(),
+        std::slice::from_ref(&record.labels)
+    );
+    batch.clear_with_policy(rdkafka::BufferPolicy::minimal());
+    assert_eq!(batch.allocated_bytes(), 0);
+}
+
+#[derive(Debug, PartialEq, Record)]
+struct OptionalCompactMetadata {
+    #[record(key)]
+    number: Option<u64>,
+    #[record(header = "labels")]
+    labels: Option<Vec<String>>,
+    value: u8,
+}
+#[test]
+fn integration_scenario_optional_compact_metadata_uses_wire_null_and_inner_encoding() {
+    for record in [
+        OptionalCompactMetadata {
+            number: None,
+            labels: None,
+            value: 1,
+        },
+        OptionalCompactMetadata {
+            number: Some(9),
+            labels: Some(vec!["a".into()]),
+            value: 2,
+        },
+    ] {
+        let mut wire = WireBatch::new();
+        record.encode_into(&mut wire).unwrap();
+        let frame = wire.get(0).unwrap();
+        let key_bytes = 9u64.to_le_bytes();
+        assert_eq!(frame.key, record.number.map(|_| key_bytes.as_slice()));
+        assert_eq!(
+            frame.headers.get(0).unwrap().value,
+            record.labels.as_ref().map(|_| &[1, 1, b'a'][..])
+        );
+        let view = OptionalCompactMetadata::view(frame).unwrap();
+        assert_eq!(view.to_owned().unwrap(), record);
+        assert_eq!(OptionalCompactMetadata::decode(frame).unwrap(), record);
+    }
+}
+
+#[derive(
+    Debug,
+    PartialEq,
+    Record,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+    zerocopy::Unaligned,
+)]
+#[repr(transparent)]
+#[record(codec = "zerocopy")]
+struct CloneSensitiveBytes {
+    bytes: [u8; 4],
+}
+impl Clone for CloneSensitiveBytes {
+    fn clone(&self) -> Self {
+        Self { bytes: [0; 4] }
+    }
+}
+#[derive(
+    Record,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+    zerocopy::Unaligned,
+)]
+#[repr(transparent)]
+#[record(codec = "zerocopy")]
+struct DirectOwnedLayout {
+    value: CloneSensitiveBytes,
+}
+#[test]
+fn integration_scenario_zerocopy_owned_decode_reads_layout_without_field_clone() {
+    let value = DirectOwnedLayout {
+        value: CloneSensitiveBytes {
+            bytes: [1, 2, 3, 4],
+        },
+    };
+    let mut wire = WireBatch::new();
+    value.encode_into(&mut wire).unwrap();
+    let decoded = DirectOwnedLayout::decode(wire.get(0).unwrap()).unwrap();
+    assert_eq!(decoded.value.bytes, [1, 2, 3, 4]);
+}

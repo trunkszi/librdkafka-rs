@@ -6,6 +6,8 @@ license.workspace = true
 
 [features]
 default = []
+tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-pemfile"]
+http = ["tls", "dep:curl", "dep:url", "dep:serde_json", "dep:memfd"]
 tracing = ["dep:tracing"]
 
 [dependencies]
@@ -17,7 +19,18 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true, optional = true }
 
+curl = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+memfd = { workspace = true, optional = true }
+
 [dev-dependencies]
+rcgen = { workspace = true }
 trybuild = { workspace = true }
 static_assertions = { workspace = true }
 

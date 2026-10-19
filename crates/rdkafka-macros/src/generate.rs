@@ -101,17 +101,7 @@ pub fn expand(model: Model) -> TokenStream {
     for (index, m) in members.iter().enumerate() {
         let ty = &projected[index];
         let decode = decode_expr(&m.ty, &rt);
-        let metadata_tokens = if has_sequence(&m.ty) {
-            quote!(<#ty as #rt::serde_bridge::BorrowDecode>::borrow_decode(&mut __metadata)?)
-        } else {
-            quote!(#rt::__private::serde::Deserialize::deserialize(&mut __metadata)?)
-        };
         let temp = format_ident!("__field_{index}", span = proc_macro2::Span::mixed_site());
-        let serialize = if m.bytes {
-            quote!(#rt::__private::serde_bytes::serialize(#temp, &mut #rt::serde_bridge::Serializer::new(__out))?;)
-        } else {
-            quote!(#rt::__private::serde::Serialize::serialize(#temp, &mut #rt::serde_bridge::Serializer::new(__out))?;)
-        };
         match &m.role {
             Role::Payload => {
                 enc.push(if m.bytes {
@@ -125,25 +115,39 @@ pub fn expand(model: Model) -> TokenStream {
                 if let Some(bytes) = metadata_bytes(&m.ty, quote!(#temp)) {
                     header_encode.push(quote!(__writer.key(#bytes)?;));
                 } else {
-                    header_encode.push(quote!(__writer.encode_key(|__out|{#serialize ::core::result::Result::Ok(())})?;));
+                    header_encode.push(compact_metadata_write(
+                        &m.ty,
+                        quote!(#temp),
+                        m.bytes,
+                        None,
+                        &rt,
+                    ));
                 }
                 if let Some(value) = metadata_decode(&m.ty, quote!(wire.key), &rt) {
                     dec.push(quote!(let #temp:#ty=#value;));
                 } else {
-                    dec.push(quote!(let mut __metadata=#rt::serde_bridge::Deserializer::new(wire.key.ok_or_else(||#rt::Error::Codec("missing record key".into()))?); let #temp:#ty=#metadata_tokens; __metadata.finish()?;));
+                    let value = compact_metadata_decode(&m.ty, quote!(wire.key), &rt);
+                    dec.push(quote!(let #temp:#ty=#value;));
                 }
             }
             Role::Header(Some(name)) => {
                 if let Some(bytes) = metadata_bytes(&m.ty, quote!(#temp)) {
                     header_encode.push(quote!(__writer.header(#name,#bytes)?;));
                 } else {
-                    header_encode.push(quote!(__writer.encode_header(#name,|__out|{#serialize ::core::result::Result::Ok(())})?;));
+                    header_encode.push(compact_metadata_write(
+                        &m.ty,
+                        quote!(#temp),
+                        m.bytes,
+                        Some(name),
+                        &rt,
+                    ));
                 }
                 let input = quote!(wire.headers.iter().find(|header|header.name==#name).and_then(|header|header.value));
                 if let Some(value) = metadata_decode(&m.ty, input.clone(), &rt) {
                     dec.push(quote!(let #temp:#ty=#value;));
                 } else {
-                    dec.push(quote!(let __bytes=(#input).ok_or_else(||#rt::Error::Codec(::std::format!("missing record header {}",#name)))?;let mut __metadata=#rt::serde_bridge::Deserializer::new(__bytes);let #temp:#ty=#metadata_tokens;__metadata.finish()?;));
+                    let value = compact_metadata_decode(&m.ty, input, &rt);
+                    dec.push(quote!(let #temp:#ty=#value;));
                 }
             }
             Role::Timestamp => {
@@ -188,13 +192,23 @@ pub fn expand(model: Model) -> TokenStream {
     } else {
         quote! {let mut __deserializer=#rt::serde_bridge::Deserializer::new(wire.payload.ok_or_else(||#rt::Error::Codec("missing record payload".into()))?);#(#dec)* __deserializer.finish()?;::core::result::Result::Ok(#view{#(#names:#decoded,)*#marker: ::core::marker::PhantomData})}
     };
+    let decode_body = if zerocopy {
+        quote!(#rt::record::zerocopy_read::<Self>(wire.payload.ok_or_else(||#rt::Error::Layout("missing record payload".into()))?))
+    } else {
+        quote!(#rt::RecordView::to_owned(&<Self as #rt::Record>::view(wire)?))
+    };
     let first = &names[0];
     quote! {
+        impl #ig #rt::column::ColumnValue for #ident #tg #wc {
+            fn extra_bytes(&self)->usize{0usize #(.saturating_add(#rt::column::ColumnValue::extra_bytes(&self.#names)))*}
+            fn clear_value(&mut self,retention:#rt::buffer_policy::Retention){#(#rt::column::ColumnValue::clear_value(&mut self.#names,retention);)*}
+            fn shrink_value(&mut self){#(#rt::column::ColumnValue::shrink_value(&mut self.#names);)*}
+        }
         impl #ig #rt::Record for #ident #tg #wc {
             type View<'__record>=#view #vtg where Self:'__record;
             type Batch=#batch #tg;
             fn encode_into(&self,destination:&mut #rt::WireBatch)->#rt::Result<()>{#encode_body}
-            fn decode(wire:#rt::WireRecord<'_>)->#rt::Result<Self>{#rt::RecordView::to_owned(&<Self as #rt::Record>::view(wire)?)}
+            fn decode(wire:#rt::WireRecord<'_>)->#rt::Result<Self>{#decode_body}
             fn view<'__record>(wire:#rt::WireRecord<'__record>)->#rt::Result<Self::View<'__record>>{#view_body}
         }
         #[doc="A borrowed typed projection over validated Kafka wire bytes."]
@@ -221,10 +235,11 @@ pub fn expand(model: Model) -> TokenStream {
             fn with_capacity(records:usize)->Self{Self{#(#names: #rt::column::ReusableColumn::with_capacity(records),)*#marker: ::core::marker::PhantomData}}
             fn len(&self)->usize{self.#first.len()}
             fn allocated_bytes(&self)->usize{0usize #(+ #rt::buffer_policy::MemoryBuffer::allocated_bytes(&self.#names))*}
-            fn clear_with_policy(&mut self,policy:#rt::BufferPolicy){let capacity=[#(#rt::buffer_policy::MemoryBuffer::record_capacity(&self.#names)),*].into_iter().max().unwrap_or(0);let retention=policy.retention(capacity,<Self as #rt::Batch>::allocated_bytes(self));#(#rt::buffer_policy::MemoryBuffer::clear_retained(&mut self.#names,retention);)*}
+            fn clear_with_policy(&mut self,policy:#rt::BufferPolicy){let capacity=[#(#rt::buffer_policy::MemoryBuffer::record_capacity(&self.#names)),*].into_iter().max().unwrap_or(0);let inline=0usize #(+ #rt::buffer_policy::MemoryBuffer::inline_bytes(&self.#names))*;let retention=policy.retention(capacity,<Self as #rt::Batch>::allocated_bytes(self),inline);#(#rt::buffer_policy::MemoryBuffer::clear_retained(&mut self.#names,retention);)*}
             fn shrink_to_fit(&mut self){#(#rt::buffer_policy::MemoryBuffer::shrink_to_fit(&mut self.#names);)*}
             fn push(&mut self,record:&Self::Record){#(self.#names.push(&record.#names);)*}
             fn push_ref<'__record>(&mut self,record:<Self::Record as #rt::Record>::View<'__record>)->#rt::Result<()>{#(#prepare)* #(#push_fields)* ::core::result::Result::Ok(())}
+            fn from_wire_batch(wire:&#rt::WireBatch)->#rt::Result<Self>{let mut batch=Self::with_capacity(wire.len());for record in wire.iter(){batch.push_ref(<#ident #tg as #rt::Record>::view(record)?)?;}::core::result::Result::Ok(batch)}
             fn to_wire_batch(&self)->#rt::Result<#rt::WireBatch>{let mut wire=#rt::WireBatch::with_capacity(self.len());for __index in 0..self.len(){#batch_encode}::core::result::Result::Ok(wire)}
         }
         impl #ig #batch #tg #wc {
@@ -243,7 +258,7 @@ pub fn expand(model: Model) -> TokenStream {
             #[doc="Clear without trimming capacity."]pub fn clear_unbounded(&mut self){<Self as #rt::Batch>::clear_unbounded(self)}
             #[doc="Release unused column capacity."]pub fn shrink_to_fit(&mut self){<Self as #rt::Batch>::shrink_to_fit(self)}
             #[doc="Encode columns into wire arenas.\n\n# Errors\nReturns a field encoding error."]pub fn to_wire_batch(&self)->#rt::Result<#rt::WireBatch>{<Self as #rt::Batch>::to_wire_batch(self)}
-            #[doc="Decode all wire records into columns.\n\n# Errors\nRejects invalid metadata or payload encodings."]pub fn from_wire_batch(wire:&#rt::WireBatch)->#rt::Result<Self>{let mut batch=Self::with_capacity(wire.len());for record in wire.iter(){batch.push_ref(<#ident #tg as #rt::Record>::view(record)?)?;}::core::result::Result::Ok(batch)}
+            #[doc="Decode all wire records into columns.\n\n# Errors\nRejects invalid metadata or payload encodings."]pub fn from_wire_batch(wire:&#rt::WireBatch)->#rt::Result<Self>{<Self as #rt::Batch>::from_wire_batch(wire)}
         }
     }
 }
@@ -398,5 +413,56 @@ fn decode_expr(ty: &Type, rt: &syn::Path) -> TokenStream {
         quote!(<#projected as #rt::serde_bridge::BorrowDecode>::borrow_decode(&mut __deserializer)?)
     } else {
         quote!(#rt::__private::serde::Deserialize::deserialize(&mut __deserializer)?)
+    }
+}
+
+fn compact_metadata_write(
+    ty: &Type,
+    value: TokenStream,
+    bytes: bool,
+    header: Option<&str>,
+    rt: &syn::Path,
+) -> TokenStream {
+    let optional = argument(ty, "Option").is_some();
+    let field = if optional {
+        quote!(__metadata_value)
+    } else {
+        value.clone()
+    };
+    let serialize = if bytes {
+        quote!(#rt::__private::serde_bytes::serialize(#field,&mut #rt::serde_bridge::Serializer::new(__out))?;)
+    } else {
+        quote!(#rt::__private::serde::Serialize::serialize(#field,&mut #rt::serde_bridge::Serializer::new(__out))?;)
+    };
+    let present = if let Some(name) = header {
+        quote!(__writer.encode_header(#name,|__out|{#serialize ::core::result::Result::Ok(())})?;)
+    } else {
+        quote!(__writer.encode_key(|__out|{#serialize ::core::result::Result::Ok(())})?;)
+    };
+    if optional {
+        let absent = if let Some(name) = header {
+            quote!(__writer.header(#name,::core::option::Option::None)?;)
+        } else {
+            quote!(__writer.key(::core::option::Option::None)?;)
+        };
+        quote!(match (#value).as_ref(){::core::option::Option::Some(__metadata_value)=>{#present},::core::option::Option::None=>{#absent}})
+    } else {
+        present
+    }
+}
+fn compact_metadata_decode(ty: &Type, input: TokenStream, rt: &syn::Path) -> TokenStream {
+    let inner = argument(ty, "Option");
+    let actual = inner.as_ref().unwrap_or(ty);
+    let projected = project(actual, rt);
+    let decode = if has_sequence(actual) {
+        quote!(<#projected as #rt::serde_bridge::BorrowDecode>::borrow_decode(&mut __metadata)?)
+    } else {
+        quote!(#rt::__private::serde::Deserialize::deserialize(&mut __metadata)?)
+    };
+    let present = quote!({let mut __metadata=#rt::serde_bridge::Deserializer::new(__metadata_bytes);let __metadata_value:#projected=#decode;__metadata.finish()?;__metadata_value});
+    if inner.is_some() {
+        quote!(match #input {::core::option::Option::Some(__metadata_bytes)=>::core::option::Option::Some(#present),::core::option::Option::None=>::core::option::Option::None})
+    } else {
+        quote!({let __metadata_bytes=(#input).ok_or_else(||#rt::Error::Codec("missing encoded metadata".into()))?;#present})
     }
 }
