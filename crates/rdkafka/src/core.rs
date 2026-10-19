@@ -86,6 +86,7 @@ pub(crate) fn message(native: cxx::UniquePtr<ffi::Message>) -> Result<Option<Mes
 }
 impl Core {
     pub fn new(conf: &Conf, kind: i32) -> Result<Rc<Self>> {
+        conf.validate_transport()?;
         Ok(Rc::new(Self {
             native: RefCell::new(ffi::client_new(&conf.native, kind)?),
             callbacks: Rc::clone(&conf.callbacks),
@@ -130,6 +131,17 @@ impl Core {
                 });
             }
             match e.kind {
+                13 => {
+                    invoke!(
+                        event,
+                        &Event::Error {
+                            code: e.code,
+                            message: e.message.clone(),
+                            is_fatal: true
+                        }
+                    );
+                    return Err(Error::Tls(e.message));
+                }
                 0 => invoke!(delivery, &DeliveryReport::from_native(&e)),
                 1..=4 => invoke!(event, &Event::from_native(&e)),
                 5 => {
@@ -207,11 +219,26 @@ impl Core {
         if let Some(topic) = topic {
             text(topic)?;
         }
-        let m = ffi::client_metadata(
+        let guard = if self.active.get() {
+            None
+        } else {
+            Some(self.begin_drive()?)
+        };
+        let outcome = ffi::client_metadata(
             self.native.borrow_mut().pin_mut(),
             topic.unwrap_or(""),
             timeout,
-        )?;
+        );
+        let callbacks = if guard.is_some() {
+            self.drain(0)
+        } else {
+            Ok(0)
+        };
+        if let Err(Error::Tls(message)) = &callbacks {
+            return Err(Error::Tls(message.clone()));
+        }
+        let m = outcome?;
+        callbacks?;
         Ok(Metadata {
             brokers: m
                 .broker_ids

@@ -30,9 +30,39 @@ Kafka source resolution checks `LIBRDKAFKA_DIR`, then `vendor/librdkafka`, then 
 checkout in `target/vendor-cache/librdkafka`. Automatic downloads use pinned revisions. A source
 override must contain `src-cpp/rdkafkacpp.h`.
 
-The native core supports plaintext broker connections. OAuth refresh callbacks and token-setting
-methods are exposed, but this OpenSSL-free build does not implement SCRAM/OAuth crypto or broker
-TLS. Unsupported native capabilities return errors.
+The native core supports plaintext, SASL/PLAIN, SCRAM-SHA-256/512, and OAuth bearer
+callbacks without OpenSSL. The native SASL providers use ring-backed SHA, HMAC,
+PBKDF2, and secure random primitives. Native source adaptations are confined to
+private build output; the pinned source cache stays unchanged.
+
+Enable the `tls` feature for verified broker `SSL` and `SASL_SSL` connections:
+
+```rust,no_run
+use rdkafka::{Conf, Producer, TlsSettings};
+
+fn main() -> rdkafka::Result<()> {
+    let mut conf = Conf::new();
+    conf.set("bootstrap.servers", "broker.example:9093")?
+        .set("security.protocol", "SSL")?;
+    conf.tls_settings(TlsSettings::new())?;
+    let producer = Producer::new(&conf)?;
+    producer.poll(0)?;
+    Ok(())
+}
+```
+
+`TlsSettings` supports native roots, additional CA PEM, an explicit verified SNI
+name, and client certificate/key pairs. Verification cannot be disabled. Requesting
+SSL without verified settings fails before client creation. Native connect/close
+hooks bridge each connection through a local Unix socket pair and a private
+bounded rustls pump. Each pump owns its TLS state; user callbacks stay on the
+calling thread. Connection close stops and joins the pump even under backpressure.
+Certificate and handshake failures produce `Error::Tls` and caller-thread
+`Event::Error` diagnostics. TLS connections currently require Unix sockets.
+
+Run the real TLS/mTLS and SASL plaintext/TLS broker matrix with
+`bash .github/scripts/test-broker-security.sh`. The harness creates ephemeral
+rcgen identities and removes only its own Docker container and fixture directory.
 
 ## Callback ownership
 
@@ -186,7 +216,7 @@ control HTTP version negotiation, `TCP_NODELAY`, connection reuse, and
 multiplexing. Requests have positive deadlines and bounded response bodies and
 headers; synchronous DNS resolution precedes the transfer deadline.
 
-`TlsSettings` configures HTTP trust and identity. The standalone `tls` feature
+`TlsSettings` is shared by broker and HTTP trust and identity. The standalone `tls` feature
 exposes its verified `build_client_config()` helper without enabling HTTP.
 Custom CA PEM, native trust roots, verified SNI override, and client identity
 must agree with curl's TLS options. Unverified TLS is rejected. Linux HTTP mTLS
@@ -196,7 +226,7 @@ Other platforms reject HTTP mTLS until equivalent backing is provided.
 
 OAuth client-credentials refresh runs synchronously and reports success or
 failure through `OAuthBearerTokenSetter`. Native poll callbacks can call
-`refresh` through an application-provided token-setter adapter. Configure the native principal and extensions
+`refresh` directly with a `Producer`, `Consumer`, or `SimpleConsumer` token target. Configure the native principal and extensions
 explicitly. HTTPS is required by default; cleartext loopback endpoints require
 explicit opt-in for local development. Errors and Debug output omit access
 tokens, client secrets, and server response bodies.

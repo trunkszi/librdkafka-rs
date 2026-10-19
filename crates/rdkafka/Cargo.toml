@@ -13,6 +13,7 @@ tracing = ["dep:tracing"]
 [dependencies]
 rdkafka-sys = { workspace = true }
 cxx = { workspace = true }
+libc = { workspace = true }
 rdkafka-macros = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
