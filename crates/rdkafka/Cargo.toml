@@ -11,6 +11,8 @@ http = ["tls", "dep:curl", "dep:url", "dep:serde_json", "dep:memfd"]
 tracing = ["dep:tracing"]
 
 [dependencies]
+rdkafka-sys = { workspace = true }
+cxx = { workspace = true }
 rdkafka-macros = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
