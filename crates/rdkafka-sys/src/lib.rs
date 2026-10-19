@@ -89,6 +89,8 @@ pub mod ffi {
     }
     unsafe extern "C++" {
         include!("rdkafka-sys/src/shim.h");
+        include!("rdkafka-sys/src/tls_callbacks.h");
+        fn tls_callback_registry_teardown_test(hooks: Box<NativeHooks>) -> bool;
         type Conf;
         type Client;
         type Queue;
@@ -317,4 +319,32 @@ fn hooks_tls_close(hooks: &NativeHooks, fd: i32) -> i32 {
 }
 fn hooks_tls_errors(hooks: &NativeHooks) -> Vec<String> {
     hooks.tls.as_ref().map_or_else(Vec::new, |tls| tls.errors())
+}
+
+#[cfg(test)]
+mod tls_registry_tests {
+    use super::*;
+    struct Hooks;
+    impl tls::BrokerTlsHooks for Hooks {
+        fn fork(&self) -> Arc<dyn tls::BrokerTlsHooks> {
+            Arc::new(Self)
+        }
+        fn connect(&self, _: i32, _: &str, _: u16, _: &str) -> i32 {
+            libc::ECONNREFUSED
+        }
+        fn close(&self, _: i32) -> i32 {
+            -1
+        }
+        fn errors(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+    #[test]
+    fn integration_lifecycle_registry_removes_dropped_callbacks_before_fd_reuse() {
+        let hooks = NativeHooks {
+            tls: Some(Arc::new(Hooks)),
+            ..Default::default()
+        };
+        assert!(ffi::tls_callback_registry_teardown_test(Box::new(hooks)));
+    }
 }

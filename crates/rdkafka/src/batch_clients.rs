@@ -174,8 +174,10 @@ impl Consumer {
             ));
         }
         let _guard = self.core.begin_drive()?;
-        let mut received =
-            native::consume_records(self.core.native.borrow_mut().pin_mut(), maximum, timeout_ms)?;
+        let outcome =
+            native::consume_records(self.core.native.borrow_mut().pin_mut(), maximum, timeout_ms)
+                .map_err(Error::from);
+        let mut received = self.core.complete(outcome)?;
         let mut entries = Vec::with_capacity(native::batch_count(&received));
         for index in 0..native::batch_count(&received) {
             let message = native::batch_take(received.pin_mut(), index);
@@ -196,7 +198,6 @@ impl Consumer {
             entries,
             _owner: Rc::clone(&self.core),
         };
-        self.core.drain(0)?;
         if self.core.callbacks.borrow().consume.is_some() {
             for record in batch.iter() {
                 // Error records remain available to the caller in the batch.

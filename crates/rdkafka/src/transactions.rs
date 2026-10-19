@@ -87,8 +87,7 @@ impl Producer {
             timeout_ms,
         )
         .map_err(crate::Error::from);
-        let callbacks = self.core.drain(0);
-        result.and(callbacks.map(|_| ()))
+        self.core.complete(result)
     }
     /// Purges records from native queues or in-flight broker requests.
     ///
