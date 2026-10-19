@@ -8,11 +8,17 @@ records and SoA batches use `#[derive(Record)]` and `zerocopy`.
 
 ## Synchronous & Thread-Affine Execution
 
-- **Synchronous**: every call executes synchronously on the calling thread.
-  `tokio`, `futures`, `async-std`, and `smol` stay out of the workspace.
-- **Thread-affine core**: `Producer`, `Consumer`, transport, `EventLoop`, and
-  `TlsSession` handles are `!Send + !Sync`. Queues, batches, views, and
-  callbacks remain on their creating thread; the data plane takes no mutex.
+- **Synchronous**: public operations and local callbacks execute synchronously
+  on the calling thread. `tokio`, `futures`, `async-std`, and `smol` stay out of
+  the workspace. Native broker I/O and broker TLS pumps run independently.
+- **Thread-affine core**: `Producer`, `Consumer`, `HttpTransport`, and
+  `WorkerSlotLease` are `!Send + !Sync`. Caller-thread record processing and
+  local callback dispatch use thread-affine state without client mutexes.
+- **Broker TLS boundary**: [ADR-0001](docs/adr/0001-rustls-broker-transport.md)
+  describes the `connect_cb` / `closesocket_cb` socketpair bridge. The native
+  socket callback registry and Rust session registry use mutexes; each connection
+  owns a TLS pump thread. A mutex-protected failure queue is drained during
+  caller-thread polling, so TLS diagnostics are an explicit locking exception.
 - **`thread_local!` scaling**: `ThreadLocalProducer` and `ThreadLocalConsumer`
   keep one client per calling OS thread. `WorkerProducer` and `WorkerConsumer`
   lease lock-free slots `0..N` on the calling thread.
@@ -47,6 +53,9 @@ records and SoA batches use `#[derive(Record)]` and `zerocopy`.
   broker buffers.
 - **Reusable SoA batches**: `Batch` and arena buffers expose `clear()` and
   `clear_with_policy(BufferPolicy)` to bound retained capacity across cycles.
+  Batch production reuses caller-owned SoA/wire buffers and crosses the Rust/C++
+  boundary once through `produce_records`; C++ calls `rd_kafka_produceva` for
+  each record, retaining independent enqueue results.
 - **Serde support**: `SerdeBridge` supports caller-buffer serialization and
   zero-copy borrowed deserialization (`Deserialize<'de>`).
 

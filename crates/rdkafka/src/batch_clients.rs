@@ -2,9 +2,11 @@
 use std::rc::Rc;
 
 use rdkafka_sys::{batch::ffi as native, ffi};
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
-    Batch, Consumer, Error, Headers, Producer, Record, Result, WireBatch, WireHeaders, WireRecord,
+    Batch, BufferPolicy, Consumer, Error, Headers, Producer, Record, Result, SerdeBridge,
+    WireBatch, WireHeaders, WireRecord,
     core::{Core, status, text},
 };
 
@@ -26,6 +28,65 @@ impl BatchProduceResult {
     }
 }
 impl Producer {
+    /// Encodes serde values into reusable caller buffers and submits one native batch.
+    /// Replaces previous wire records; scratch is emptied with the default policy.
+    /// # Errors
+    /// Returns serialization or pre-enqueue validation errors. Native per-record
+    /// enqueue errors remain in the result; no records enqueue on encoding failure.
+    pub fn produce_serde_batch<T: Serialize>(
+        &self,
+        topic: &str,
+        values: &[T],
+        batch: &mut WireBatch,
+        scratch: &mut Vec<u8>,
+    ) -> Result<BatchProduceResult> {
+        batch.clear_with_policy(BufferPolicy::default());
+        SerdeBridge::encode_batch_into(topic, values, batch, scratch)?;
+        self.produce_wire_records(batch, None)
+    }
+    /// Encodes with a caller codec and submits one native batch using default retention.
+    /// # Errors
+    /// Returns codec or pre-enqueue validation errors before submitting any record.
+    pub fn produce_batch_using<T>(
+        &self,
+        topic: &str,
+        values: &[T],
+        batch: &mut WireBatch,
+        scratch: &mut Vec<u8>,
+        encode: impl FnMut(&T, &mut Vec<u8>) -> Result<()>,
+    ) -> Result<BatchProduceResult> {
+        self.produce_batch_using_with_policy(
+            topic,
+            values,
+            batch,
+            scratch,
+            BufferPolicy::default(),
+            encode,
+        )
+    }
+    /// Encodes with a caller codec, bounding retained scratch and prior wire capacity.
+    /// Previous wire records are cleared with `policy` before encoding. Encoded
+    /// records remain in `batch` for inspection, including a prefix on codec errors.
+    /// Scratch is emptied and trimmed on success, errors, and codec unwinding.
+    /// # Errors
+    /// Returns codec or validation errors before enqueue; native per-record enqueue
+    /// failures are retained in the result without rolling back accepted records.
+    pub fn produce_batch_using_with_policy<T>(
+        &self,
+        topic: &str,
+        values: &[T],
+        batch: &mut WireBatch,
+        scratch: &mut Vec<u8>,
+        policy: BufferPolicy,
+        encode: impl FnMut(&T, &mut Vec<u8>) -> Result<()>,
+    ) -> Result<BatchProduceResult> {
+        batch.clear_with_policy(policy);
+        SerdeBridge::encode_batch_into_using_with_policy(
+            topic, values, batch, scratch, policy, encode,
+        )?;
+        self.produce_wire_records(batch, None)
+    }
+
     /// Encodes a typed column batch and submits it in one native bridge call.
     /// # Errors
     /// Returns codec, invalid metadata, or caller-thread partitioner errors before
@@ -94,6 +155,59 @@ pub struct ReceivedBatch {
     _owner: Rc<Core>,
 }
 impl ReceivedBatch {
+    /// Decodes native payloads using a caller codec, borrowing from this batch.
+    /// Earlier visitor effects remain on a later failure; native buffers stay owned.
+    /// # Errors
+    /// Returns native message, null payload, codec, or visitor errors unchanged.
+    pub fn decode_with_using<'de, T>(
+        &'de self,
+        mut decode: impl FnMut(&'de [u8]) -> Result<T>,
+        mut on_value: impl FnMut(T) -> Result<()>,
+    ) -> Result<usize> {
+        for record in self.iter() {
+            let payload = record?
+                .payload
+                .ok_or_else(|| Error::Codec("cannot decode a null payload".into()))?;
+            on_value(SerdeBridge::decode_borrowed_using(payload, &mut decode)?)?;
+        }
+        Ok(self.len())
+    }
+    /// Appends decoded values, permitting values borrowed from this native batch.
+    /// # Errors
+    /// Returns native, null payload, or codec errors; earlier appends remain.
+    pub fn decode_into_using<'de, T>(
+        &'de self,
+        output: &mut Vec<T>,
+        decode: impl FnMut(&'de [u8]) -> Result<T>,
+    ) -> Result<usize> {
+        self.decode_with_using(decode, |value| {
+            output.push(value);
+            Ok(())
+        })
+    }
+    /// Fills existing slots, retaining later slots and rejecting short slices atomically.
+    /// # Errors
+    /// Returns length mismatch before decoding, or native/null/codec errors after
+    /// retaining successfully overwritten earlier slots.
+    pub fn decode_into_slice_using<'de, T>(
+        &'de self,
+        output: &mut [T],
+        decode: impl FnMut(&'de [u8]) -> Result<T>,
+    ) -> Result<usize> {
+        if output.len() < self.len() {
+            return Err(Error::BatchLengthMismatch {
+                expected: self.len(),
+                actual: output.len(),
+            });
+        }
+        let mut index = 0;
+        self.decode_with_using(decode, |value| {
+            output[index] = value;
+            index += 1;
+            Ok(())
+        })
+    }
+
     /// Number of received records, including native error records.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -162,6 +276,68 @@ impl ReceivedBatch {
     }
 }
 impl Consumer {
+    /// Receives one native batch and visits serde values without a staging vector.
+    /// # Errors
+    /// Returns receive, native, null payload, codec, or visitor errors. The whole
+    /// fetched batch is consumed even if decoding or visiting fails.
+    pub fn consume_serde_with<T: DeserializeOwned>(
+        &self,
+        maximum: usize,
+        timeout_ms: i32,
+        on_value: impl FnMut(T) -> Result<()>,
+    ) -> Result<usize> {
+        self.consume_with_using(
+            maximum,
+            timeout_ms,
+            |payload| SerdeBridge::decode_borrowed::<T>(payload),
+            on_value,
+        )
+    }
+    /// Receives and decodes a native batch with caller codecs and visitors.
+    /// `T` cannot borrow from temporary receive storage; retain a `ReceivedBatch`
+    /// and use its decoding methods when borrowed output must outlive this call.
+    /// # Errors
+    /// Returns receive, native, null payload, codec, or visitor errors; fetched
+    /// records are consumed even on failure, including unvisited records.
+    pub fn consume_with_using<T>(
+        &self,
+        maximum: usize,
+        timeout_ms: i32,
+        decode: impl for<'de> FnMut(&'de [u8]) -> Result<T>,
+        on_value: impl FnMut(T) -> Result<()>,
+    ) -> Result<usize> {
+        self.consume_batch(maximum, timeout_ms)?
+            .decode_with_using(decode, on_value)
+    }
+    /// Appends caller-decoded values from one native receive operation.
+    /// # Errors
+    /// Returns receive/native/null/codec errors, preserving earlier appends.
+    /// The entire fetched batch is consumed on failure.
+    pub fn consume_into_using<T>(
+        &self,
+        maximum: usize,
+        timeout_ms: i32,
+        output: &mut Vec<T>,
+        decode: impl for<'de> FnMut(&'de [u8]) -> Result<T>,
+    ) -> Result<usize> {
+        self.consume_batch(maximum, timeout_ms)?
+            .decode_into_using(output, decode)
+    }
+    /// Fills caller slots from one native batch, without intermediate decoded storage.
+    /// # Errors
+    /// Returns receive/native/null/codec or length errors. Too few output slots
+    /// leaves the output unchanged but the fetched batch is already consumed.
+    pub fn consume_into_slice_using<T>(
+        &self,
+        maximum: usize,
+        timeout_ms: i32,
+        output: &mut [T],
+        decode: impl for<'de> FnMut(&'de [u8]) -> Result<T>,
+    ) -> Result<usize> {
+        self.consume_batch(maximum, timeout_ms)?
+            .decode_into_slice_using(output, decode)
+    }
+
     /// Receives at most `maximum` messages with one native batch queue operation.
     /// Local consume observers run on this thread after the native borrow ends.
     /// # Errors
