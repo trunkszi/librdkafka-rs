@@ -13,6 +13,7 @@ pub(crate) struct Core {
     active: Rc<Cell<bool>>,
     pub partition_counts: RefCell<std::collections::HashMap<String, i32>>,
     pub pending_error: RefCell<Option<Error>>,
+    pending_tls_error: RefCell<Option<Error>>,
     pending_events: RefCell<std::collections::VecDeque<ffi::NativeEvent>>,
     pub rebalance_snapshot: RefCell<Option<(bool, String)>>,
 }
@@ -99,6 +100,7 @@ impl Core {
             active: Rc::clone(&conf.callbacks.borrow().active),
             rebalance_snapshot: RefCell::default(),
             pending_error: RefCell::default(),
+            pending_tls_error: RefCell::default(),
             partition_counts: RefCell::default(),
             pending_events: RefCell::default(),
         }))
@@ -151,7 +153,9 @@ impl Core {
             }
             match e.kind {
                 13 => {
-                    record!(Error::Tls(e.message.clone()));
+                    self.pending_tls_error
+                        .borrow_mut()
+                        .get_or_insert_with(|| Error::Tls(e.message.clone()));
                     invoke!(
                         event,
                         &Event::Error {
@@ -211,7 +215,7 @@ impl Core {
     }
     /// Completes an operation after its native borrow has been released.
     /// The caller retains its drive guard throughout callback dispatch. The first
-    /// callback failure is retained; a retained TLS failure precedes operation errors.
+    /// failure of each category is retained; TLS precedes other callback and operation errors.
     pub fn complete<T>(&self, outcome: Result<T>) -> Result<T> {
         let callbacks = self.drain(0);
         match callbacks {
@@ -221,7 +225,11 @@ impl Core {
     }
     /// Reports a deferred callback failure before another receive advances offsets.
     pub fn take_pending_error(&self) -> Result<()> {
-        self.pending_error.borrow_mut().take().map_or(Ok(()), Err)
+        self.pending_tls_error
+            .borrow_mut()
+            .take()
+            .or_else(|| self.pending_error.borrow_mut().take())
+            .map_or(Ok(()), Err)
     }
     /// Returns fetched records before reporting failures from background callbacks.
     pub fn complete_received<T>(
@@ -242,10 +250,12 @@ impl Core {
             && nonempty(value)
         {
             if let Err(error) = callbacks {
-                let mut pending = self.pending_error.borrow_mut();
-                if pending.is_none() {
-                    *pending = Some(error);
-                }
+                let pending = if matches!(error, Error::Tls(_)) {
+                    &self.pending_tls_error
+                } else {
+                    &self.pending_error
+                };
+                pending.borrow_mut().get_or_insert(error);
             }
             return outcome;
         }

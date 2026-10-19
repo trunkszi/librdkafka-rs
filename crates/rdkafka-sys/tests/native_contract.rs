@@ -177,6 +177,15 @@ fn integration_scenario_native_murmur2_and_large_flush_preserve_all_deliveries()
 
 #[test]
 fn integration_lifecycle_manual_rebalance_close_has_bounded_fallback() {
+    manual_rebalance_close_has_bounded_fallback(true);
+}
+
+#[test]
+fn integration_lifecycle_manual_rebalance_drop_has_bounded_fallback() {
+    manual_rebalance_close_has_bounded_fallback(false);
+}
+
+fn manual_rebalance_close_has_bounded_fallback(begin_close: bool) {
     use std::time::{Duration, Instant};
     let mut conf = ffi::conf_new(false);
     for (key, value) in [
@@ -196,8 +205,10 @@ fn integration_lifecycle_manual_rebalance_close_has_bounded_fallback() {
     for _ in 0..10 {
         drop(ffi::consume(consumer.pin_mut(), 10));
     }
-    ffi::consumer_close_begin(consumer.pin_mut()).expect("start close");
     let begin = Instant::now();
+    if begin_close {
+        ffi::consumer_close_begin(consumer.pin_mut()).expect("start close");
+    }
     drop(consumer);
     assert!(begin.elapsed() < Duration::from_secs(7));
 }

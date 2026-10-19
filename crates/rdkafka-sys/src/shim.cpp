@@ -61,11 +61,14 @@ Callbacks::~Callbacks() {
   // State destroys the native handle first, while its close hooks can use us.
   tls_untrack_callbacks(this);
 }
-static void finish_close(State &state, rd_kafka_queue_t *queue) {
+void abort_pending_rebalance(State &state) {
+  auto &callbacks = state.callbacks;
+  callbacks.manual_rebalance = false;
+  if (!callbacks.rebalance_pending) return;
+  callbacks.rebalance_pending = false;
   auto *raw = state.handle->c_ptr();
   // Failed Rust rebalance callbacks cannot leave native revocation pending.
-  const char *protocol = rd_kafka_rebalance_protocol(raw);
-  if (protocol && std::string(protocol) == "COOPERATIVE") {
+  if (callbacks.rebalance_cooperative) {
     rd_kafka_topic_partition_list_t *parts = nullptr;
     auto code = rd_kafka_assignment(raw, &parts);
     std::unique_ptr<rd_kafka_topic_partition_list_t, decltype(&rd_kafka_topic_partition_list_destroy)>
@@ -75,6 +78,9 @@ static void finish_close(State &state, rd_kafka_queue_t *queue) {
       if (error) rd_kafka_error_destroy(error);
     }
   } else rd_kafka_assign(raw, nullptr);
+}
+static void finish_close(State &state, rd_kafka_queue_t *queue) {
+  auto *raw = state.handle->c_ptr();
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (!rd_kafka_consumer_closed(raw) && std::chrono::steady_clock::now() < deadline) {
     auto *message = rd_kafka_consume_queue(queue, 100);
@@ -88,6 +94,7 @@ State::~State() {
   std::unique_ptr<rd_kafka_queue_t, decltype(&rd_kafka_queue_destroy)>
       queue(rd_kafka_queue_new(consumer->c_ptr()), rd_kafka_queue_destroy);
   if (!queue) return;
+  abort_pending_rebalance(*this);
   auto *error = rd_kafka_consumer_close_queue(consumer->c_ptr(), queue.get());
   if (error) { rd_kafka_error_destroy(error); return; }
   close_started = true;
@@ -196,6 +203,10 @@ void Callbacks::rebalance_cb(RdKafka::KafkaConsumer *c, RdKafka::ErrorCode e,
   auto event = partition_event(5, e, p);
   event.assignment_lost = c->assignment_lost();
   event.rebalance_protocol = c->rebalance_protocol();
+  if (manual_rebalance) {
+    rebalance_pending = true;
+    rebalance_cooperative = event.rebalance_protocol == "COOPERATIVE";
+  }
   events->push(std::move(event));
   if (manual_rebalance) return;
   if (c->rebalance_protocol() == "COOPERATIVE") {

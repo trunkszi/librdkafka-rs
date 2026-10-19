@@ -170,9 +170,11 @@ client_partitions(Client &c, int32_t op,
   std::string rich_error;
   switch (op) {
   case 0:
+    c.state->callbacks.rebalance_pending = false;
     e = rd_kafka_assign(c.raw(), list);
     break;
   case 1:
+    c.state->callbacks.rebalance_pending = false;
     e = rd_kafka_assign(c.raw(), nullptr);
     break;
   case 2:

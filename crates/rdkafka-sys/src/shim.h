@@ -29,6 +29,8 @@ public:
   ~Callbacks();
   rust::Box<NativeHooks> hooks;
   bool manual_rebalance = false;
+  bool rebalance_pending = false;
+  bool rebalance_cooperative = false;
   bool has_partitioner = false;
   std::unique_ptr<EventQueue> events;
   rust::Vec<NativeEvent> drain();
@@ -56,6 +58,7 @@ struct State {
   Callbacks callbacks;
   std::unique_ptr<RdKafka::Handle> handle;
 };
+void abort_pending_rebalance(State &);
 struct Conf {
   bool topic;
   bool consume_observer = false;
