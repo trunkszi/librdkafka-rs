@@ -43,9 +43,9 @@ config = {'redpanda': {
                              for name, port in zip(names, ports)],
     'kafka_api_tls': [{'name': name, 'enabled': True,
                       'require_client_auth': name == 'mtls',
-                      'cert_file': '/security/server.pem',
-                      'key_file': '/security/server.key',
-                      'truststore_file': '/security/ca.pem'}
+                      'cert_file': '/tmp/security/server.pem',
+                      'key_file': '/tmp/security/server.key',
+                      'truststore_file': '/tmp/security/ca.pem'}
                      for name in ['tls', 'mtls', 'sasl_tls']],
 }}
 with open(sys.argv[1] + '/redpanda.yaml', 'w') as target:
@@ -53,16 +53,15 @@ with open(sys.argv[1] + '/redpanda.yaml', 'w') as target:
 print(*ports)
 PY
 )
-# Redpanda runs as an unprivileged user inside the container.
-chmod 755 "$security_dir"
-chmod 644 "$security_dir"/*
+# Transfer fixtures without depending on the daemon's host mount namespace.
+security_tar_b64=$(tar -C "$security_dir" -cf - . | base64 -w0)
 created=true
 docker run --detach --entrypoint /bin/sh --name "$container" --label librdkafka-rs.security-test=true \
-  -v "$security_dir:/security:ro" \
+  -e SECURITY_TAR_B64="$security_tar_b64" \
   -p "127.0.0.1:$tls_port:9092" -p "127.0.0.1:$mtls_port:9093" \
   -p "127.0.0.1:$sasl_port:9094" -p "127.0.0.1:$sasl_tls_port:9095" \
   "${RDKAFKA_SECURITY_IMAGE:-docker.redpanda.com/redpandadata/redpanda:v25.3.1}" \
-  -c 'cp /security/redpanda.yaml /tmp/redpanda.yaml; exec /usr/bin/rpk redpanda start --config /tmp/redpanda.yaml "$@"' \
+  -c 'set -eu; mkdir -p /tmp/security; printf "%s" "$SECURITY_TAR_B64" | base64 -d | tar -C /tmp/security -xf -; chmod 644 /tmp/security/*; unset SECURITY_TAR_B64; exec /usr/bin/rpk redpanda start --config /tmp/security/redpanda.yaml "$@"' \
   security-broker --overprovisioned --smp 1 \
   --memory 1G --reserve-memory 0M --check=false \
   --set enable_sasl=true --set 'sasl_mechanisms=["SCRAM","PLAIN"]' \
