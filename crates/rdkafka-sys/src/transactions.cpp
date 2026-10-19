@@ -78,9 +78,9 @@ void consumer_incremental(Client &client,
   }
   if (!selected->cnt && !complete_rebalance)
     return;
-  client.state->callbacks.rebalance_pending = false;
   checked(assign ? rd_kafka_incremental_assign(client.raw(), selected.get())
                  : rd_kafka_incremental_unassign(client.raw(), selected.get()));
+  client.state->callbacks.rebalance_pending = false;
 }
 bool consumer_assignment_lost(const Client &client) {
   return rd_kafka_assignment_lost(client.raw());
