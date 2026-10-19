@@ -50,6 +50,7 @@ impl Failures {
 
 struct Session {
     wake: UnixStream,
+    remote_wake: TcpStream,
     worker: JoinHandle<()>,
     stopping: Arc<AtomicBool>,
     failures: Arc<Mutex<Failures>>,
@@ -67,6 +68,17 @@ impl Session {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .push(format!("broker TLS shutdown: {error}")),
+        }
+        // Either socket may be excluded from poll after a read half closes.
+        // Shutting down both endpoints wakes whichever descriptor is active.
+        match self.remote_wake.shutdown(Shutdown::Both) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
+            Err(error) => self
+                .failures
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(format!("broker TLS remote shutdown: {error}")),
         }
         // A panic is contained by the transport worker and never reaches C++.
         if self.worker.join().is_err() {
@@ -117,6 +129,7 @@ impl BrokerTls {
         local.set_nonblocking(true).map_err(io_error)?;
         native.set_nonblocking(true).map_err(io_error)?;
         let wake = local.try_clone().map_err(io_error)?;
+        let remote_wake = stream.try_clone().map_err(io_error)?;
         let failures = self.failures.clone();
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = stopping.clone();
@@ -162,6 +175,7 @@ impl BrokerTls {
             let error = std::io::Error::last_os_error();
             Session {
                 wake,
+                remote_wake,
                 worker,
                 stopping,
                 failures: self.failures.clone(),
@@ -177,6 +191,7 @@ impl BrokerTls {
                 fd,
                 Session {
                     wake,
+                    remote_wake,
                     worker,
                     stopping,
                     failures: self.failures.clone(),

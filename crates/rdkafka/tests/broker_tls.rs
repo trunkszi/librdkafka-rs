@@ -175,3 +175,94 @@ fn integration_lifecycle_scenario_broker_tls_accepts_sequential_clients() -> Tes
     assert!(server.finish()?.metadata_requests >= 2);
     Ok(())
 }
+
+fn rejects_certificate(operation: &str) -> server::TestResult<()> {
+    use rdkafka::{Consumer, Offset, Queue, SimpleConsumer, Topic, TopicPartition};
+    let mut peer = server::Server::new(&rustls::version::TLS13, false)?;
+    let unrelated = server::Identity::new()?;
+    assert_ne!(peer.identity.ca, unrelated.ca);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = Rc::clone(&events);
+    let caller = std::thread::current().id();
+    let mut conf = Conf::new();
+    conf.set("bootstrap.servers", &peer.address.to_string())?
+        .set("security.protocol", "SSL")?
+        .set("api.version.request", "false")?
+        .set("broker.version.fallback", "0.8.2.2")?;
+    conf.tls_settings(
+        TlsSettings::new()
+            .with_native_roots(false)
+            .with_ca_pem(unrelated.ca)
+            .with_server_name("fixture.test"),
+    )?;
+    conf.event_cb(move |event| {
+        assert_eq!(std::thread::current().id(), caller);
+        if let Event::Error { message, .. } = event {
+            observed.borrow_mut().push(message.clone());
+        }
+    });
+    let result = match operation {
+        "watermark" => Producer::new(&conf)?
+            .query_watermark_offsets("events", 0, 1500)
+            .map(|_| ()),
+        "committed" => {
+            conf.set("group.id", "tls-failure-propagation")?;
+            Consumer::new(&conf)?
+                .committed(
+                    &[TopicPartition::new("events", 0, 0)],
+                    Duration::from_millis(1500),
+                )
+                .map(|_| ())
+        }
+        "simple" => {
+            let client = SimpleConsumer::new(&conf)?;
+            let topic = Topic::for_consumer(&client, "events", &Conf::topic())?;
+            client.start(&topic, 0, Offset::Beginning)?;
+            let result = client.consume(&topic, 0, 1500).map(|_| ());
+            client.stop(&topic, 0)?;
+            result
+        }
+        "queue" => {
+            let client = SimpleConsumer::new(&conf)?;
+            let topic = Topic::for_consumer(&client, "events", &Conf::topic())?;
+            let queue = Queue::new(&client)?;
+            client.start_queue(&topic, 0, Offset::Beginning, &queue)?;
+            let result = queue.consume(1500).map(|_| ());
+            client.stop(&topic, 0)?;
+            result
+        }
+        _ => unreachable!("controlled operation name"),
+    };
+    assert!(
+        matches!(result, Err(Error::Tls(_))),
+        "{operation}: {result:?}"
+    );
+    assert!(
+        events
+            .borrow()
+            .iter()
+            .any(|message| message.contains("TLS")),
+        "{operation}: missing TLS event"
+    );
+    assert!(
+        peer.finish().is_err(),
+        "invalid certificate reached Kafka metadata"
+    );
+    Ok(())
+}
+#[test]
+fn integration_scenario_watermark_preserves_tls_failure() -> server::TestResult<()> {
+    rejects_certificate("watermark")
+}
+#[test]
+fn integration_scenario_committed_preserves_tls_failure() -> server::TestResult<()> {
+    rejects_certificate("committed")
+}
+#[test]
+fn integration_scenario_simple_consume_preserves_tls_failure() -> server::TestResult<()> {
+    rejects_certificate("simple")
+}
+#[test]
+fn integration_scenario_queue_consume_preserves_tls_failure() -> server::TestResult<()> {
+    rejects_certificate("queue")
+}

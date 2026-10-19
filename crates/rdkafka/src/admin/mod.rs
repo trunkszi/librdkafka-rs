@@ -58,26 +58,22 @@ impl AdminClient {
             }
         }
         let _guard = self.core.begin_drive()?;
-        let outcome = {
+        let outcome = (|| {
             let native = self.core.native.borrow();
             let native = native
                 .as_ref()
                 .ok_or_else(|| Error::Config("administrative client unavailable".into()))?;
-            ffi::admin_request(native, op, requests, timeout_ms)
-        };
-        let callbacks = self.core.drain(0);
-        if let Err(Error::Tls(message)) = &callbacks {
-            return Err(Error::Tls(message.clone()));
-        }
-        let result = outcome?;
-        if result.code != 0 {
-            return Err(Error::native(result.code, result.message));
-        }
-        callbacks?;
-        Ok(AdminResult {
-            resources: result.resources,
-        })
+            let result = ffi::admin_request(native, op, requests, timeout_ms)?;
+            if result.code != 0 {
+                return Err(Error::native(result.code, result.message));
+            }
+            Ok(AdminResult {
+                resources: result.resources,
+            })
+        })();
+        self.core.complete(outcome)
     }
+
     /// # Errors
     /// Returns invalid input, timeout, or request-wide broker errors; inspect per-topic errors.
     pub fn create_topics(&self, topics: &[NewTopic], timeout_ms: i32) -> Result<AdminResult> {

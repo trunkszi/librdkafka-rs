@@ -98,19 +98,18 @@ impl Queue {
     pub fn poll(&self, timeout_ms: i32) -> Result<i32> {
         let _guard = self.core.begin_drive()?;
         let n = ffi::queue_poll(self.native.borrow_mut().pin_mut(), timeout_ms);
-        self.core.drain(0)?;
-        Ok(n)
+        self.core.complete(Ok(n))
     }
     /// Consumes one message.
     /// # Errors
     /// Returns message or callback errors.
     pub fn consume(&self, timeout_ms: i32) -> Result<Option<Message>> {
         let _guard = self.core.begin_drive()?;
-        let m = message(ffi::queue_consume(
+        let outcome = message(ffi::queue_consume(
             self.native.borrow_mut().pin_mut(),
             timeout_ms,
-        ))?;
-        self.core.drain(0)?;
+        ));
+        let m = self.core.complete(outcome)?;
         if let Some(v) = &m {
             self.core.observe(v);
         }

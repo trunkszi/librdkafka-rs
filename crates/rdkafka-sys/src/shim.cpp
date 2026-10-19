@@ -55,7 +55,10 @@ struct EventQueue {
 };
 Callbacks::Callbacks()
     : hooks(hooks_empty()), events(std::make_unique<EventQueue>()) {}
-Callbacks::~Callbacks() = default;
+Callbacks::~Callbacks() {
+  // State destroys the native handle first, while its close hooks can use us.
+  tls_untrack_callbacks(this);
+}
 State::~State() {
   callbacks.manual_rebalance = false;
   if (auto *consumer = dynamic_cast<RdKafka::KafkaConsumer *>(handle.get())) {

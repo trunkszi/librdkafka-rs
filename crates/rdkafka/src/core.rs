@@ -109,7 +109,21 @@ impl Core {
     }
     pub fn drain(&self, timeout: i32) -> Result<usize> {
         let events = ffi::client_poll(self.native.borrow_mut().pin_mut(), timeout);
+        self.dispatch(events)
+    }
+    fn dispatch(&self, events: Vec<ffi::NativeEvent>) -> Result<usize> {
         let n = events.len();
+        let mut failure = None;
+        macro_rules! record {
+            ($error:expr) => {{
+                let error = $error;
+                if failure.is_none()
+                    || (matches!(&error, Error::Tls(_)) && !matches!(&failure, Some(Error::Tls(_))))
+                {
+                    failure = Some(error);
+                }
+            }};
+        }
         macro_rules! invoke {
             ($slot:ident, $($arg:expr),*) => {{
                 let callback=self.callbacks.borrow_mut().$slot.take();
@@ -122,13 +136,14 @@ impl Core {
         }
         for e in events {
             if e.kind == 12 {
-                return Err(Error::Native {
+                record!(Error::Native {
                     code: ErrorCode(e.code),
                     message: e.message,
                     retriable: true,
                     fatal: false,
                     txn_requires_abort: false,
                 });
+                continue;
             }
             match e.kind {
                 13 => {
@@ -140,7 +155,7 @@ impl Core {
                             is_fatal: true
                         }
                     );
-                    return Err(Error::Tls(e.message));
+                    record!(Error::Tls(e.message));
                 }
                 0 => invoke!(delivery, &DeliveryReport::from_native(&e)),
                 1..=4 => invoke!(event, &Event::from_native(&e)),
@@ -159,13 +174,18 @@ impl Core {
                         if state.oauth.is_none() {
                             state.oauth = Some(cb);
                         }
-                        result?;
+                        if let Err(error) = result {
+                            record!(error);
+                        }
                     }
                 }
                 8 => invoke!(socket, e.code, e.partition, e.offset as i32),
                 9 => invoke!(open, &e.message, e.code, e.partition),
                 10 => {
-                    status(e.code)?;
+                    if let Err(error) = status(e.code) {
+                        record!(error);
+                        continue;
+                    }
                     let mut headers = Headers::new();
                     for header in e.headers {
                         headers.add(
@@ -187,7 +207,31 @@ impl Core {
                 _ => {}
             }
         }
-        Ok(n)
+        failure.map_or(Ok(n), Err)
+    }
+    /// Completes an operation after its native borrow has been released.
+    /// The caller retains its drive guard throughout callback dispatch. TLS
+    /// failures take priority; other callback failures follow operation errors.
+    pub fn complete<T>(&self, outcome: Result<T>) -> Result<T> {
+        let callbacks = self.drain(0);
+        match callbacks {
+            Err(error @ Error::Tls(_)) => Err(error),
+            callbacks => outcome.and_then(|value| callbacks.map(|_| value)),
+        }
+    }
+    /// Queries from callbacks reuse the active drive without recursive dispatch.
+    pub fn query<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let guard = if self.active.get() {
+            None
+        } else {
+            Some(self.begin_drive()?)
+        };
+        let outcome = operation();
+        if guard.is_some() {
+            self.complete(outcome)
+        } else {
+            outcome
+        }
     }
     pub fn observe(&self, m: &Message) {
         let callback = self.callbacks.borrow_mut().consume.take();
@@ -208,37 +252,28 @@ impl Core {
         for p in parts {
             text(&p.topic)?;
         }
-        Ok(from_parts(ffi::client_partitions(
-            self.native.borrow_mut().pin_mut(),
-            op,
-            &partitions(parts),
-            timeout,
-        )?))
+        self.query(|| {
+            let outcome = ffi::client_partitions(
+                self.native.borrow_mut().pin_mut(),
+                op,
+                &partitions(parts),
+                timeout,
+            );
+            outcome.map(from_parts).map_err(Error::from)
+        })
     }
     pub fn metadata(&self, topic: Option<&str>, timeout: i32) -> Result<Metadata> {
         if let Some(topic) = topic {
             text(topic)?;
         }
-        let guard = if self.active.get() {
-            None
-        } else {
-            Some(self.begin_drive()?)
-        };
-        let outcome = ffi::client_metadata(
-            self.native.borrow_mut().pin_mut(),
-            topic.unwrap_or(""),
-            timeout,
-        );
-        let callbacks = if guard.is_some() {
-            self.drain(0)
-        } else {
-            Ok(0)
-        };
-        if let Err(Error::Tls(message)) = &callbacks {
-            return Err(Error::Tls(message.clone()));
-        }
-        let m = outcome?;
-        callbacks?;
+        let m = self.query(|| {
+            ffi::client_metadata(
+                self.native.borrow_mut().pin_mut(),
+                topic.unwrap_or(""),
+                timeout,
+            )
+            .map_err(Error::from)
+        })?;
         Ok(Metadata {
             brokers: m
                 .broker_ids
@@ -283,6 +318,10 @@ pub(crate) fn timeout(duration: std::time::Duration) -> Result<i32> {
     i32::try_from(duration.as_millis())
         .map_err(|_| Error::Config("timeout exceeds native millisecond range".into()))
 }
+
+#[cfg(test)]
+#[path = "core_tests.rs"]
+mod dispatch_tests;
 
 #[cfg(test)]
 mod tests {

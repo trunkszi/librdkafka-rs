@@ -203,8 +203,7 @@ impl Producer {
     pub fn flush(&self, timeout_ms: i32) -> Result<()> {
         let _guard = self.core.begin_drive()?;
         let code = ffi::client_flush(self.core.native.borrow_mut().pin_mut(), timeout_ms);
-        self.core.drain(0)?;
-        status(code)
+        self.core.complete(status(code))
     }
 }
 /// A native consumer-group client.
@@ -266,8 +265,7 @@ impl Consumer {
             self.core.native.borrow_mut().pin_mut(),
             timeout_ms,
         ));
-        self.core.drain(0)?;
-        let m = m?;
+        let m = self.core.complete(m)?;
         if let Some(v) = &m {
             self.core.observe(v);
         }
@@ -280,8 +278,9 @@ impl Consumer {
     pub fn consume_native(&self, timeout_ms: i32) -> Result<Option<ReceivedMessage>> {
         let _guard = self.core.begin_drive()?;
         let native = ffi::consume(self.core.native.borrow_mut().pin_mut(), timeout_ms);
-        let message = ReceivedMessage::wrap(native, &self.core)?;
-        self.core.drain(0)?;
+        let message = self
+            .core
+            .complete(ReceivedMessage::wrap(native, &self.core))?;
         if let Some(m) = &message
             && self.core.callbacks.borrow().consume.is_some()
         {
@@ -375,7 +374,7 @@ macro_rules! common {
         /// Queries authoritative watermark offsets.
         /// # Errors
         /// Returns native query failures or malformed native responses.
-        pub fn query_watermark_offsets(&self,topic:&str,partition:i32,timeout_ms:i32)->Result<(i64,i64)>{crate::core::text(topic)?;let v=ffi::client_watermarks(self.core.native.borrow_mut().pin_mut(),topic,partition,timeout_ms,false)?;match v.as_slice(){[lo,hi]=>Ok((*lo,*hi)),_=>Err(Error::Layout("watermark response must contain two offsets".into()))}}
+        pub fn query_watermark_offsets(&self,topic:&str,partition:i32,timeout_ms:i32)->Result<(i64,i64)>{crate::core::text(topic)?;self.core.query(||{let v=ffi::client_watermarks(self.core.native.borrow_mut().pin_mut(),topic,partition,timeout_ms,false)?;match v.as_slice(){[lo,hi]=>Ok((*lo,*hi)),_=>Err(Error::Layout("watermark response must contain two offsets".into()))}})}
         /// Reads cached watermark offsets.
         /// # Errors
         /// Returns native query failures.
@@ -446,13 +445,15 @@ impl SimpleConsumer {
         timeout_ms: i32,
     ) -> Result<()> {
         self.check_topic(topic)?;
-        status(ffi::simple_seek(
-            self.core.native.borrow_mut().pin_mut(),
-            &topic.native,
-            partition,
-            offset.value(),
-            timeout_ms,
-        ))
+        self.core.query(|| {
+            status(ffi::simple_seek(
+                self.core.native.borrow_mut().pin_mut(),
+                &topic.native,
+                partition,
+                offset.value(),
+                timeout_ms,
+            ))
+        })
     }
     /// Consumes an explicit partition.
     /// # Errors
@@ -465,13 +466,13 @@ impl SimpleConsumer {
     ) -> Result<Option<Message>> {
         let _guard = self.core.begin_drive()?;
         self.check_topic(topic)?;
-        let m = message(ffi::simple_consume(
+        let outcome = message(ffi::simple_consume(
             self.core.native.borrow_mut().pin_mut(),
             &topic.native,
             partition,
             timeout_ms,
-        ))?;
-        self.core.drain(0)?;
+        ));
+        let m = self.core.complete(outcome)?;
         if let Some(v) = &m {
             self.core.observe(v);
         }

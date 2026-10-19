@@ -153,64 +153,98 @@ impl Pending {
 }
 
 pub(super) fn run(
+    connection: rustls::ClientConnection,
+    remote: TcpStream,
+    local: &UnixStream,
+    stopping: &AtomicBool,
+) -> io::Result<()> {
+    run_loop(connection, remote, local, stopping, |_| {})
+}
+
+fn run_loop(
     mut connection: rustls::ClientConnection,
     mut remote: TcpStream,
     mut local: &UnixStream,
     stopping: &AtomicBool,
+    mut before_poll: impl FnMut(&[libc::pollfd]),
 ) -> io::Result<()> {
     let mut incoming = Pending::new();
     let mut outgoing = Pending::new();
-    let mut peer_closed = false;
+    let mut remote_eof = false;
+    let mut local_eof = false;
+    let mut read_shutdown = false;
+    let mut write_shutdown = false;
     loop {
         if stopping.load(Ordering::Acquire) {
             return Ok(());
         }
-        if incoming.empty() && !incoming.fill(&mut connection.reader())? {
-            peer_closed = true;
+        if !remote_eof && incoming.empty() && !incoming.fill(&mut connection.reader())? {
+            remote_eof = true;
         }
         let had_incoming = !incoming.empty();
         incoming.drain(&mut local)?;
         outgoing.drain(&mut connection.writer())?;
-        if peer_closed && incoming.empty() {
+        if remote_eof && incoming.empty() && !read_shutdown {
             local.shutdown(Shutdown::Write)?;
+            read_shutdown = true;
+        }
+        if local_eof && outgoing.empty() && !write_shutdown {
+            connection.send_close_notify();
+            write_shutdown = true;
+        }
+        if local_eof && remote_eof && incoming.empty() && !connection.wants_write() {
             return Ok(());
         }
         if had_incoming && incoming.empty() {
             continue;
         }
+        // poll reports HUP even with an empty events mask. Exclude a closed or
+        // backpressured read half unless ciphertext still needs to be written.
+        let remote_events = if !remote_eof && incoming.empty() {
+            libc::POLLIN
+        } else {
+            0
+        } | if connection.wants_write() {
+            libc::POLLOUT
+        } else {
+            0
+        };
+        let local_events = if !local_eof && outgoing.empty() && !connection.wants_write() {
+            libc::POLLIN
+        } else {
+            0
+        } | if !incoming.empty() { libc::POLLOUT } else { 0 };
         let mut descriptors = [
             libc::pollfd {
-                fd: remote.as_raw_fd(),
-                events: if incoming.empty() { libc::POLLIN } else { 0 }
-                    | if connection.wants_write() {
-                        libc::POLLOUT
-                    } else {
-                        0
-                    },
+                fd: if remote_events == 0 {
+                    -1
+                } else {
+                    remote.as_raw_fd()
+                },
+                events: remote_events,
                 revents: 0,
             },
             libc::pollfd {
-                fd: local.as_raw_fd(),
-                events: if outgoing.empty() && !connection.wants_write() {
-                    libc::POLLIN
+                fd: if local_events == 0 {
+                    -1
                 } else {
-                    0
-                } | if !incoming.empty() { libc::POLLOUT } else { 0 },
+                    local.as_raw_fd()
+                },
+                events: local_events,
                 revents: 0,
             },
         ];
+        before_poll(&descriptors);
         wait(&mut descriptors, -1)?;
-        if descriptors[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+        if stopping.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !local_eof
+            && descriptors[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
             && outgoing.empty()
             && !outgoing.fill(&mut local)?
         {
-            connection.send_close_notify();
-            match connection.write_tls(&mut remote) {
-                Ok(_) => {}
-                Err(error) if would_block(&error) => {}
-                Err(error) => return Err(error),
-            }
-            return Ok(());
+            local_eof = true;
         }
         if descriptors[0].revents & libc::POLLOUT != 0 {
             match connection.write_tls(&mut remote) {
@@ -219,7 +253,8 @@ pub(super) fn run(
                 Err(error) => return Err(error),
             }
         }
-        if incoming.empty()
+        if !remote_eof
+            && incoming.empty()
             && descriptors[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
         {
             match connection.read_tls(&mut remote) {
@@ -238,3 +273,7 @@ pub(super) fn run(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "pump_tests.rs"]
+mod tests;
