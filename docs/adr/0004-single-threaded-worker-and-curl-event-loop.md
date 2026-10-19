@@ -1,0 +1,3 @@
+# Thread-Affine `!Send + !Sync` Workers and `curl-rust` EventLoop HTTP
+
+All client handles (`Producer`, `Consumer`, `SimpleConsumer`, `AdminClient`, `Queue`, `TlsSession`, `HttpTransport`, `SchemaRegistryClient`, and `OAuthBearerHttpClient`) are strictly thread-affine (`!Send + !Sync`), executing callbacks and data-plane operations synchronously on the calling OS thread without mutexes or cross-thread channels. `librdkafka` builds with `WITH_CURL=OFF`, and all HTTP/2 + `rustls` operations (OIDC token refresh for `SASL/OAUTHBEARER` and Schema Registry requests) run on the calling thread through `curl-rust` (`feat/event-loop-ws`).
