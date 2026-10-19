@@ -360,7 +360,7 @@ pub(crate) fn text(value: &str) -> Result<()> {
 }
 
 pub(crate) fn timeout(duration: std::time::Duration) -> Result<i32> {
-    i32::try_from(duration.as_millis())
+    i32::try_from(duration.as_nanos().div_ceil(1_000_000))
         .map_err(|_| Error::Config("timeout exceeds native millisecond range".into()))
 }
 

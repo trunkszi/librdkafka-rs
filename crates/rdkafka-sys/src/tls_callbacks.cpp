@@ -47,13 +47,6 @@ static int tls_connect(int fd, const sockaddr *address, int size,
                   service, sizeof(service), NI_NUMERICHOST | NI_NUMERICSERV))
     return EINVAL;
   std::string peer = name ? name : host;
-  if (!peer.empty() && peer.front() == '[') {
-    auto end = peer.find(']');
-    if (end != std::string::npos) peer = peer.substr(1, end - 1);
-  } else {
-    auto colon = peer.rfind(':');
-    if (colon != std::string::npos) peer.resize(colon);
-  }
   auto port = static_cast<uint16_t>(std::strtoul(service, nullptr, 10));
   return hooks_tls_connect(*callbacks->hooks, fd, host, port, peer);
 }
@@ -64,6 +57,21 @@ static int tls_close(int fd, void *) {
 void tls_install_callbacks(rd_kafka_conf_t *conf) {
   rd_kafka_conf_set_connect_cb(conf, tls_connect);
   rd_kafka_conf_set_closesocket_cb(conf, tls_close);
+}
+int32_t tls_callback_peer_name_test(rust::Box<NativeHooks> hooks, rust::Str name) {
+  Callbacks callbacks;
+  callbacks.hooks = std::move(hooks);
+  int fd = callbacks.socket_cb(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return errno;
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(9092);
+  std::string peer(name);
+  int result = tls_connect(fd, reinterpret_cast<const sockaddr *>(&address),
+                            sizeof(address), peer.c_str(), nullptr);
+  tls_untrack_callbacks(&callbacks);
+  ::close(fd);
+  return result;
 }
 bool tls_callback_registry_teardown_test(rust::Box<NativeHooks> hooks) {
   struct Descriptor {

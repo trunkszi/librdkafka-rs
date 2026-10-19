@@ -52,6 +52,7 @@ public:
 };
 struct State {
   ~State();
+  bool close_started = false;
   Callbacks callbacks;
   std::unique_ptr<RdKafka::Handle> handle;
 };
@@ -74,18 +75,18 @@ struct Client {
 };
 struct Topic {
   std::shared_ptr<State> owner;
-  rd_kafka_topic_t *value;
+  rd_kafka_topic_t *value = nullptr;
   ~Topic();
 };
 struct Queue {
   std::shared_ptr<State> owner;
   std::shared_ptr<State> forwarded_owner;
-  rd_kafka_queue_t *value;
+  rd_kafka_queue_t *value = nullptr;
   ~Queue();
 };
 struct Message {
   std::shared_ptr<State> owner;
-  rd_kafka_message_t *value;
+  rd_kafka_message_t *value = nullptr;
   ~Message();
 };
 int32_t partitioner_pointer(const rd_kafka_topic_t *, const void *, size_t,

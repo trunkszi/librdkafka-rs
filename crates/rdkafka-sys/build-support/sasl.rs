@@ -172,7 +172,7 @@ pub fn source(source: &Path, out: &Path, manifest: &Path) -> PathBuf {
         "#include \"rdbase64.h\"",
         "#include \"rdbase64.h\"\n#include \"sasl_crypto.h\"",
     );
-    let base64 = replace(&base64, "#else\n        return -2;\n#endif", "#else\n        int decoded;\n        if (in->size % 4 != 0 || in->size > INT_MAX) return -1;\n        out->ptr = rd_malloc((in->size / 4) * 3 + 1);\n        decoded = rdkafka_rs_base64_decode((unsigned char *)out->ptr,\n                    (const unsigned char *)in->ptr, in->size);\n        if (decoded < 0) {\n                rd_free(out->ptr);\n                out->ptr = NULL;\n                out->size = 0;\n                return -1;\n        }\n        out->size = (size_t)decoded;\n        return 0;\n#endif");
+    let base64 = replace(&base64, "#else\n        return -2;\n#endif", "#else\n        int decoded;\n        if (in->size % 4 != 0 || in->size > INT_MAX) return -1;\n        out->ptr = rd_malloc((in->size / 4) * 3 + 1);\n        if (!out->ptr) { out->size = 0; return -1; }\n        decoded = rdkafka_rs_base64_decode((unsigned char *)out->ptr,\n                    (const unsigned char *)in->ptr, in->size);\n        if (decoded < 0) {\n                rd_free(out->ptr);\n                out->ptr = NULL;\n                out->size = 0;\n                return -1;\n        }\n        out->size = (size_t)decoded;\n        return 0;\n#endif");
     write_changed(&private.join("src/rdbase64.c"), &base64);
     let header = fs::read_to_string(manifest.join("build-support/sasl_crypto.h"))
         .expect("read native SASL crypto adapter");

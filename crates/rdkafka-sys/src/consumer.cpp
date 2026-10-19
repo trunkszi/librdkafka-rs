@@ -14,20 +14,24 @@ static std::unique_ptr<Message> wrap(rd_kafka_message_t *p,
                                      std::shared_ptr<State> owner) {
   if (!p)
     return nullptr;
+  std::unique_ptr<rd_kafka_message_t, decltype(&rd_kafka_message_destroy)>
+      owner_message(p, rd_kafka_message_destroy);
   auto out = std::make_unique<Message>();
   out->owner = std::move(owner);
-  out->value = p;
+  out->value = owner_message.release();
   return out;
 }
 int32_t subscribe(Client &c, rust::Slice<const rust::String> names) {
   auto *list = rd_kafka_topic_partition_list_new(names.size());
+  std::unique_ptr<rd_kafka_topic_partition_list_t, decltype(&rd_kafka_topic_partition_list_destroy)>
+      owner(list, rd_kafka_topic_partition_list_destroy);
+  if (!list) throw std::bad_alloc();
   for (const auto &n : names) {
     std::string name(n);
     rd_kafka_topic_partition_list_add(list, name.c_str(),
                                       RD_KAFKA_PARTITION_UA);
   }
   auto e = rd_kafka_subscribe(c.raw(), list);
-  rd_kafka_topic_partition_list_destroy(list);
   return e;
 }
 int32_t unsubscribe(Client &c) { return rd_kafka_unsubscribe(c.raw()); }
@@ -35,14 +39,16 @@ rust::Vec<NativePartition> consumer_list(Client &c, bool assignment) {
   rd_kafka_topic_partition_list_t *list = nullptr;
   auto e = assignment ? rd_kafka_assignment(c.raw(), &list)
                       : rd_kafka_subscription(c.raw(), &list);
+  std::unique_ptr<rd_kafka_topic_partition_list_t, decltype(&rd_kafka_topic_partition_list_destroy)>
+      owner(list, rd_kafka_topic_partition_list_destroy);
   if (e)
     throw std::runtime_error(std::to_string(e) + ":" + rd_kafka_err2str(e));
+  if (!list) throw std::runtime_error("native partition list unavailable");
   rust::Vec<NativePartition> out;
   for (int i = 0; i < list->cnt; ++i) {
     auto &p = list->elems[i];
     out.push_back(partition_from(p));
   }
-  rd_kafka_topic_partition_list_destroy(list);
   return out;
 }
 std::unique_ptr<Message> consume(Client &c, int32_t timeout) {
@@ -51,6 +57,7 @@ std::unique_ptr<Message> consume(Client &c, int32_t timeout) {
 void consumer_close_begin(Client &c) {
   if (c.close_queue || rd_kafka_consumer_closed(c.raw())) return;
   c.close_queue.reset(rd_kafka_queue_new(c.raw()));
+  if (!c.close_queue) throw std::bad_alloc();
   auto *error = rd_kafka_consumer_close_queue(c.raw(), c.close_queue.get());
   if (error) {
     std::string message = std::to_string(rd_kafka_error_code(error)) + ":" + rd_kafka_error_string(error);
@@ -58,6 +65,7 @@ void consumer_close_begin(Client &c) {
     c.close_queue.reset();
     throw std::runtime_error(message);
   }
+  c.state->close_started = true;
 }
 bool consumer_close_poll(Client &c, int32_t timeout) {
   if (c.close_queue) {
@@ -129,13 +137,15 @@ int64_t message_timestamp(const Message &m) {
 }
 bool message_has_key(const Message &m) { return m.value->key != nullptr; }
 rust::Slice<const uint8_t> message_key(const Message &m) {
-  return {static_cast<const uint8_t *>(m.value->key), m.value->key_len};
+  static const uint8_t empty = 0;
+  return {m.value->key_len ? static_cast<const uint8_t *>(m.value->key) : &empty, m.value->key_len};
 }
 bool message_has_payload(const Message &m) {
   return m.value->payload != nullptr;
 }
 rust::Slice<const uint8_t> message_payload(const Message &m) {
-  return {static_cast<const uint8_t *>(m.value->payload), m.value->len};
+  static const uint8_t empty = 0;
+  return {m.value->len ? static_cast<const uint8_t *>(m.value->payload) : &empty, m.value->len};
 }
 rust::Vec<NativeHeader> message_headers(const Message &m) {
   rust::Vec<NativeHeader> out;

@@ -2,6 +2,7 @@
 #include "rdkafka-sys/src/tls_callbacks.h"
 #include "rdkafka-sys/src/lib.rs.h"
 #include <cerrno>
+#include <chrono>
 #include <unistd.h>
 #include <thread>
 #include <array>
@@ -60,21 +61,43 @@ Callbacks::~Callbacks() {
   // State destroys the native handle first, while its close hooks can use us.
   tls_untrack_callbacks(this);
 }
+static void finish_close(State &state, rd_kafka_queue_t *queue) {
+  auto *raw = state.handle->c_ptr();
+  // Failed Rust rebalance callbacks cannot leave native revocation pending.
+  const char *protocol = rd_kafka_rebalance_protocol(raw);
+  if (protocol && std::string(protocol) == "COOPERATIVE") {
+    rd_kafka_topic_partition_list_t *parts = nullptr;
+    auto code = rd_kafka_assignment(raw, &parts);
+    std::unique_ptr<rd_kafka_topic_partition_list_t, decltype(&rd_kafka_topic_partition_list_destroy)>
+        owner(parts, rd_kafka_topic_partition_list_destroy);
+    if (!code && parts) {
+      auto *error = rd_kafka_incremental_unassign(raw, parts);
+      if (error) rd_kafka_error_destroy(error);
+    }
+  } else rd_kafka_assign(raw, nullptr);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!rd_kafka_consumer_closed(raw) && std::chrono::steady_clock::now() < deadline) {
+    auto *message = rd_kafka_consume_queue(queue, 100);
+    if (message) rd_kafka_message_destroy(message);
+  }
+}
 State::~State() {
   callbacks.manual_rebalance = false;
-  if (auto *consumer = dynamic_cast<RdKafka::KafkaConsumer *>(handle.get())) {
-    if (!rd_kafka_consumer_closed(consumer->c_ptr())) consumer->close();
-  }
+  auto *consumer = dynamic_cast<RdKafka::KafkaConsumer *>(handle.get());
+  if (!consumer || close_started || rd_kafka_consumer_closed(consumer->c_ptr())) return;
+  std::unique_ptr<rd_kafka_queue_t, decltype(&rd_kafka_queue_destroy)>
+      queue(rd_kafka_queue_new(consumer->c_ptr()), rd_kafka_queue_destroy);
+  if (!queue) return;
+  auto *error = rd_kafka_consumer_close_queue(consumer->c_ptr(), queue.get());
+  if (error) { rd_kafka_error_destroy(error); return; }
+  close_started = true;
+  finish_close(*this, queue.get());
+  // KafkaConsumerImpl's destructor uses NO_CONSUMER_CLOSE if the deadline expires.
 }
 Client::~Client() {
   if (!state) return;
   state->callbacks.manual_rebalance = false;
-  if (close_queue) {
-    while (!rd_kafka_consumer_closed(raw())) {
-      auto *message = rd_kafka_consume_queue(close_queue.get(), 100);
-      if (message) rd_kafka_message_destroy(message);
-    }
-  }
+  if (close_queue) finish_close(*state, close_queue.get());
 }
 Conf::~Conf() = default;
 static std::string str(rust::Str s) { return std::string(s); }
@@ -204,7 +227,6 @@ int32_t Callbacks::partitioner_cb(const RdKafka::Topic *t,
 }
 int32_t Callbacks::partitioner_cb(const RdKafka::Topic *t, const void *key,
                                   size_t len, int32_t n, void *) {
-  record(11, 0, "native partitioner", t->name());
   return rd_kafka_msg_partitioner_consistent_random(
       const_cast<RdKafka::Topic *>(t)->c_ptr(), key, len, n, nullptr, nullptr);
 }
@@ -277,7 +299,13 @@ bool native_callback_contract_test() {
       (fcntl(file, F_GETFD) & FD_CLOEXEC);
   if (socket >= 0) ::close(socket);
   if (file >= 0) ::close(file);
-  return valid;
+  rd_kafka_message_t raw{};
+  Message message{};
+  message.value = &raw;
+  const bool empty = message_key(message).empty() && message_key(message).data() &&
+                     message_payload(message).empty() && message_payload(message).data();
+  message.value = nullptr;
+  return valid && empty;
 }
 int Callbacks::socket_cb(int domain, int type, int protocol) {
   record(8, domain, "socket", "", type, protocol);
@@ -398,6 +426,7 @@ std::unique_ptr<Client> client_new_with_partitioner(const Conf &c, int32_t kind,
         rd_kafka_conf_get_default_topic_conf(cfg->c_ptr_global());
     auto *copy = topic_conf ? rd_kafka_topic_conf_dup(topic_conf)
                             : rd_kafka_topic_conf_new();
+    if (!copy) throw std::bad_alloc();
     rd_kafka_topic_conf_set_opaque(copy, &cb);
     rd_kafka_topic_conf_set_partitioner_cb(copy, partitioner_pointer);
     rd_kafka_conf_set_default_topic_conf(cfg->c_ptr_global(), copy);

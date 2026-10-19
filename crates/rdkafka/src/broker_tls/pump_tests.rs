@@ -221,3 +221,148 @@ fn integration_lifecycle_scenario_stop_wakes_poll_after_local_halfclose() {
     release.send(()).unwrap();
     server.join().unwrap().unwrap();
 }
+
+#[test]
+fn integration_lifecycle_scenario_small_tls_buffer_flushes_large_plaintext() {
+    let payload = vec![47; BUFFER_SIZE * 4 + 17];
+    let expected = payload.clone();
+    let (mut connection, remote, server) = connected(move |mut stream| {
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received)?;
+        assert_eq!(received, expected);
+        stream.conn.send_close_notify();
+        stream.flush()?;
+        Ok(())
+    });
+    connection.set_buffer_limit(Some(1024));
+    small_send_buffer(&remote);
+    let (local, mut native) = UnixStream::pair().unwrap();
+    local.set_nonblocking(true).unwrap();
+    native
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    native
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let worker =
+        std::thread::spawn(move || run(connection, remote, &local, &AtomicBool::new(false)));
+    native.write_all(&payload).unwrap();
+    native.shutdown(Shutdown::Write).unwrap();
+    let mut response = Vec::new();
+    native.read_to_end(&mut response).unwrap();
+    assert!(response.is_empty());
+    worker.join().unwrap().unwrap();
+    server.join().unwrap().unwrap();
+}
+
+#[test]
+fn integration_lifecycle_scenario_remote_reset_breaks_bidirectional_backpressure() {
+    let (reset_tx, reset_rx) = mpsc::channel();
+    let (connection, remote, server) = connected(move |mut stream| {
+        stream.write_all(&vec![29; BUFFER_SIZE * 2])?;
+        reset_rx.recv_timeout(Duration::from_secs(5))?;
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: linger is a valid socket option with its exact byte length.
+        let result = unsafe {
+            libc::setsockopt(
+                stream.sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&linger as *const libc::linger).cast(),
+                std::mem::size_of_val(&linger) as _,
+            )
+        };
+        assert_eq!(result, 0);
+        Ok(())
+    });
+    small_send_buffer(&remote);
+    let (local, mut native) = UnixStream::pair().unwrap();
+    small_send_buffer(&local);
+    local.set_nonblocking(true).unwrap();
+    native
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let (blocked_tx, blocked_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let observed = polls.clone();
+    let worker = std::thread::spawn(move || {
+        let mut announced = false;
+        let outcome = run_loop(connection, remote, &local, &AtomicBool::new(false), |fds| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            if !announced
+                && fds[0].events & libc::POLLOUT != 0
+                && fds[1].events & libc::POLLOUT != 0
+            {
+                announced = true;
+                blocked_tx.send(()).unwrap();
+            }
+        });
+        done_tx.send(()).unwrap();
+        outcome
+    });
+    let writer = std::thread::spawn(move || native.write_all(&vec![83; BUFFER_SIZE * 32]));
+    blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    reset_tx.send(()).unwrap();
+    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        worker.join().unwrap().is_err(),
+        "reset must fail the transport"
+    );
+    let _writer_outcome = writer.join().unwrap();
+    server.join().unwrap().unwrap();
+    assert!(
+        polls.load(Ordering::Relaxed) < 1024,
+        "reset repeatedly woke the pump"
+    );
+}
+
+#[test]
+fn unit_scenario_handshake_timeout_overflow_returns_error() {
+    let (mut connection, remote, server) = connected(|_| Ok(()));
+    let error = handshake(&mut connection, &remote, Duration::MAX).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    server.join().unwrap().unwrap();
+}
+
+#[test]
+fn integration_lifecycle_scenario_native_close_releases_pending_plaintext() {
+    let (release_tx, release_rx) = mpsc::channel();
+    let (connection, remote, server) = connected(move |mut stream| {
+        stream.write_all(&vec![57; BUFFER_SIZE * 2])?;
+        release_rx.recv_timeout(Duration::from_secs(5))?;
+        Ok(())
+    });
+    let (local, native) = UnixStream::pair().unwrap();
+    small_send_buffer(&local);
+    local.set_nonblocking(true).unwrap();
+    let (blocked_tx, blocked_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut announced = false;
+        let mut polls = 0;
+        let result = run_loop(connection, remote, &local, &AtomicBool::new(false), |fds| {
+            polls += 1;
+            if !announced && fds[1].events & libc::POLLOUT != 0 {
+                announced = true;
+                blocked_tx.send(()).unwrap();
+            }
+        });
+        done_tx.send(()).unwrap();
+        (result, polls)
+    });
+    blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    drop(native);
+    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (outcome, polls) = worker.join().unwrap();
+    assert!(
+        outcome.is_err(),
+        "native close must release pending plaintext"
+    );
+    assert!(polls < 1024, "native HUP repeatedly woke the pump");
+    release_tx.send(()).unwrap();
+    server.join().unwrap().unwrap();
+}
