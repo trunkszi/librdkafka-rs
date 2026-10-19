@@ -228,10 +228,24 @@ fn integration_lifecycle_queue_forward_and_fd_wakeup() -> Result<()> {
 }
 
 #[test]
-fn integration_scenario_native_observer_overflow_fails_closed() -> Result<()> {
+fn integration_scenario_native_delivery_burst_is_lossless() -> Result<()> {
     let (_host, b) = host()?;
-    let p = producer(&b)?;
-    let topic = format!("overflow-{}", std::process::id());
+    let delivered = Rc::new(RefCell::new(vec![false; 5000]));
+    let observed = Rc::clone(&delivered);
+    let callback_thread = std::thread::current().id();
+    let mut config = Conf::new();
+    config.set("bootstrap.servers", &b)?;
+    config.delivery_report_cb(move |report| {
+        assert_eq!(std::thread::current().id(), callback_thread);
+        assert!(report.error.is_none(), "delivery failed: {report:?}");
+        let mut seen = observed.borrow_mut();
+        let token = usize::try_from(report.token).expect("valid delivery token");
+        assert!(token < seen.len(), "unexpected delivery token");
+        assert!(!seen[token], "duplicate delivery report");
+        seen[token] = true;
+    });
+    let p = Producer::new(&config)?;
+    let topic = format!("delivery-burst-{}", std::process::id());
     for token in 0..5000 {
         p.produce(ProduceRecord {
             topic: &topic,
@@ -243,11 +257,9 @@ fn integration_scenario_native_observer_overflow_fails_closed() -> Result<()> {
             token,
         })?;
     }
-    let e = p
-        .flush(15000)
-        .expect_err("bounded observer queue must expose delivery loss");
-    assert!(e.is_queue_full());
-    assert!(e.to_string().contains("NATIVE_OBSERVER_QUEUE_OVERFLOW"));
+    p.flush(15000)?;
+    assert!(delivered.borrow().iter().all(|seen| *seen));
+    assert_eq!(p.outq_len(), 0);
     Ok(())
 }
 
