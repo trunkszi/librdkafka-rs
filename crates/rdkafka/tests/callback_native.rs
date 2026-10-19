@@ -240,3 +240,29 @@ fn integration_scenario_rebalance_panic_before_ack_cleanup() -> Result<()> {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[test]
+fn integration_scenario_partitioner_panic_restores_callback_before_retry() -> Result<()> {
+    let mut config = Conf::new();
+    config.set("test.mock.num.brokers", "1")?;
+    let calls = Rc::new(std::cell::Cell::new(0));
+    let captured = Rc::clone(&calls);
+    config.partitioner_cb(move |_, _, count| {
+        captured.set(captured.get() + 1);
+        if captured.get() == 1 {
+            panic!("partitioner rejected first invocation");
+        }
+        count - 1
+    });
+    let p = Producer::new(&config)?;
+    let topic = format!("partitioner-unwind-{}", std::process::id());
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        p.produce(ProduceRecord::new(&topic, Some(b"must-not-enqueue")))
+    }));
+    assert!(failed.is_err());
+    assert_eq!(p.outq_len(), 0);
+    p.produce(ProduceRecord::new(&topic, Some(b"retry")))?;
+    p.flush(10000)?;
+    assert_eq!(calls.get(), 2);
+    Ok(())
+}

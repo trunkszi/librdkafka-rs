@@ -1,5 +1,5 @@
 //! Producer and consumer handles with caller-thread operations.
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::rc::Rc;
 
 use rdkafka_sys::ffi;
 
@@ -25,7 +25,6 @@ impl<'a> From<(&'a Topic, ProduceRecord<'a>)> for ProduceRequest<'a> {
 /// A synchronous producer whose callbacks execute during caller polling.
 pub struct Producer {
     pub(crate) core: Rc<Core>,
-    counts: RefCell<HashMap<String, i32>>,
 }
 impl Producer {
     /// Creates a native producer.
@@ -34,7 +33,6 @@ impl Producer {
     pub fn new(conf: &Conf) -> Result<Self> {
         Ok(Self {
             core: Core::new(conf, 0)?,
-            counts: RefCell::default(),
         })
     }
     /// Enqueues a record, preserving null keys and payloads.
@@ -137,7 +135,7 @@ impl Producer {
     }
     fn resolve_partition_using(
         &self,
-        callbacks: &Rc<RefCell<crate::callbacks::Callbacks>>,
+        callbacks: &Rc<std::cell::RefCell<crate::callbacks::Callbacks>>,
         topic: &str,
         key: Option<&[u8]>,
         partition: i32,
@@ -149,39 +147,34 @@ impl Producer {
             c.partitioner.is_some() || c.key_partitioner.is_some()
         };
         if partition == PARTITION_UA && has_partitioner {
-            let cached = self.counts.borrow().get(topic).copied();
-            let count = if let Some(v) = cached {
-                v
+            let cached = self.core.partition_counts.borrow().get(topic).copied();
+            let count = if let Some(count) = cached {
+                count
             } else {
-                let m = self.metadata(Some(topic), 5000)?;
-                let n = m
-                    .topics
-                    .iter()
-                    .find(|t| t.name == topic)
-                    .map_or(0, |t| t.partitions.len() as i32);
-                if n <= 0 {
-                    return Err(Error::native(3, "topic has no available partitions"));
-                }
-                self.counts.borrow_mut().insert(topic.into(), n);
-                n
+                self.metadata(Some(topic), 5000)?;
+                self.core
+                    .partition_counts
+                    .borrow()
+                    .get(topic)
+                    .copied()
+                    .unwrap_or(0)
             };
-            let callback = callbacks.borrow_mut().partitioner.take();
-            if let Some(mut cb) = callback {
-                partition = cb(topic, key, count);
-                let mut c = callbacks.borrow_mut();
-                if c.partitioner.is_none() {
-                    c.partitioner = Some(cb);
-                }
-            } else {
-                let callback = callbacks.borrow_mut().key_partitioner.take();
-                if let Some(mut cb) = callback {
-                    partition = cb(topic, key, count);
-                    let mut c = callbacks.borrow_mut();
-                    if c.key_partitioner.is_none() {
-                        c.key_partitioner = Some(cb);
-                    }
-                }
+            if count <= 0 {
+                return Err(Error::native(3, "topic has no available partitions"));
             }
+            partition = crate::callbacks::with_callback(
+                callbacks,
+                |c| &mut c.partitioner,
+                |cb| cb(topic, key, count),
+            )
+            .or_else(|| {
+                crate::callbacks::with_callback(
+                    callbacks,
+                    |c| &mut c.key_partitioner,
+                    |cb| cb(topic, key, count),
+                )
+            })
+            .unwrap_or(partition);
             if partition < 0 || partition >= count {
                 return Err(Error::native(
                     -186,
@@ -261,11 +254,12 @@ impl Consumer {
     /// Returns native message or callback errors.
     pub fn consume(&self, timeout_ms: i32) -> Result<Option<Message>> {
         let _guard = self.core.begin_drive()?;
+        self.core.take_pending_error()?;
         let m = message(ffi::consume(
             self.core.native.borrow_mut().pin_mut(),
             timeout_ms,
         ));
-        let m = self.core.complete(m)?;
+        let m = self.core.complete_received(m, Option::is_some)?;
         if let Some(v) = &m {
             self.core.observe(v);
         }
@@ -277,10 +271,11 @@ impl Consumer {
     /// Returns message or callback errors.
     pub fn consume_native(&self, timeout_ms: i32) -> Result<Option<ReceivedMessage>> {
         let _guard = self.core.begin_drive()?;
+        self.core.take_pending_error()?;
         let native = ffi::consume(self.core.native.borrow_mut().pin_mut(), timeout_ms);
         let message = self
             .core
-            .complete(ReceivedMessage::wrap(native, &self.core))?;
+            .complete_received(ReceivedMessage::wrap(native, &self.core), Option::is_some)?;
         if let Some(m) = &message
             && self.core.callbacks.borrow().consume.is_some()
         {
@@ -466,13 +461,14 @@ impl SimpleConsumer {
     ) -> Result<Option<Message>> {
         let _guard = self.core.begin_drive()?;
         self.check_topic(topic)?;
+        self.core.take_pending_error()?;
         let outcome = message(ffi::simple_consume(
             self.core.native.borrow_mut().pin_mut(),
             &topic.native,
             partition,
             timeout_ms,
         ));
-        let m = self.core.complete(outcome)?;
+        let m = self.core.complete_received(outcome, Option::is_some)?;
         if let Some(v) = &m {
             self.core.observe(v);
         }

@@ -11,6 +11,9 @@ pub(crate) struct Core {
     pub native: RefCell<cxx::UniquePtr<ffi::Client>>,
     pub callbacks: Rc<RefCell<Callbacks>>,
     active: Rc<Cell<bool>>,
+    pub partition_counts: RefCell<std::collections::HashMap<String, i32>>,
+    pub pending_error: RefCell<Option<Error>>,
+    pending_events: RefCell<std::collections::VecDeque<ffi::NativeEvent>>,
     pub rebalance_snapshot: RefCell<Option<(bool, String)>>,
 }
 pub(crate) struct DriveGuard {
@@ -88,10 +91,16 @@ impl Core {
     pub fn new(conf: &Conf, kind: i32) -> Result<Rc<Self>> {
         conf.validate_transport()?;
         Ok(Rc::new(Self {
-            native: RefCell::new(ffi::client_new(&conf.native, kind)?),
+            native: RefCell::new(ffi::client_new_with_partitioner(&conf.native, kind, {
+                let state = conf.callbacks.borrow();
+                state.partitioner.is_some() || state.key_partitioner.is_some()
+            })?),
             callbacks: Rc::clone(&conf.callbacks),
             active: Rc::clone(&conf.callbacks.borrow().active),
             rebalance_snapshot: RefCell::default(),
+            pending_error: RefCell::default(),
+            partition_counts: RefCell::default(),
+            pending_events: RefCell::default(),
         }))
     }
     pub fn begin_drive(&self) -> Result<DriveGuard> {
@@ -105,6 +114,7 @@ impl Core {
     }
     pub fn poll(&self, timeout: i32) -> Result<usize> {
         let _guard = self.begin_drive()?;
+        self.take_pending_error()?;
         self.drain(timeout)
     }
     pub fn drain(&self, timeout: i32) -> Result<usize> {
@@ -112,7 +122,6 @@ impl Core {
         self.dispatch(events)
     }
     fn dispatch(&self, events: Vec<ffi::NativeEvent>) -> Result<usize> {
-        let n = events.len();
         let mut failure = None;
         macro_rules! record {
             ($error:expr) => {{
@@ -126,15 +135,15 @@ impl Core {
         }
         macro_rules! invoke {
             ($slot:ident, $($arg:expr),*) => {{
-                let callback=self.callbacks.borrow_mut().$slot.take();
-                if let Some(mut cb)=callback {
-                    cb($($arg),*);
-                    let mut callbacks=self.callbacks.borrow_mut();
-                    if callbacks.$slot.is_none(){callbacks.$slot=Some(cb);}
-                }
+                with_callback(&self.callbacks, |state| &mut state.$slot, |cb| cb($($arg),*));
             }}
         }
-        for e in events {
+        self.pending_events.borrow_mut().extend(events);
+        let n = self.pending_events.borrow().len();
+        loop {
+            let Some(e) = self.pending_events.borrow_mut().pop_front() else {
+                break;
+            };
             if e.kind == 12 {
                 record!(Error::Native {
                     code: ErrorCode(e.code),
@@ -167,16 +176,12 @@ impl Core {
                 }
                 6 => invoke!(commit, e.code, &from_parts(e.partitions)),
                 7 => {
-                    let callback = self.callbacks.borrow_mut().oauth.take();
-                    if let Some(mut cb) = callback {
-                        let result = cb(&e.message);
-                        let mut state = self.callbacks.borrow_mut();
-                        if state.oauth.is_none() {
-                            state.oauth = Some(cb);
-                        }
-                        if let Err(error) = result {
-                            record!(error);
-                        }
+                    if let Some(Err(error)) = with_callback(
+                        &self.callbacks,
+                        |state| &mut state.oauth,
+                        |cb| cb(&e.message),
+                    ) {
+                        record!(error);
                     }
                 }
                 8 => invoke!(socket, e.code, e.partition, e.offset as i32),
@@ -219,6 +224,41 @@ impl Core {
             callbacks => outcome.and_then(|value| callbacks.map(|_| value)),
         }
     }
+    /// Reports a deferred callback failure before another receive advances offsets.
+    pub fn take_pending_error(&self) -> Result<()> {
+        self.pending_error.borrow_mut().take().map_or(Ok(()), Err)
+    }
+    /// Returns fetched records before reporting failures from background callbacks.
+    pub fn complete_received<T>(
+        &self,
+        outcome: Result<T>,
+        nonempty: impl FnOnce(&T) -> bool,
+    ) -> Result<T> {
+        let callbacks = self.drain(0);
+        self.finish_received(outcome, callbacks, nonempty)
+    }
+    fn finish_received<T>(
+        &self,
+        outcome: Result<T>,
+        callbacks: Result<usize>,
+        nonempty: impl FnOnce(&T) -> bool,
+    ) -> Result<T> {
+        if let Ok(value) = &outcome
+            && nonempty(value)
+        {
+            if let Err(error) = callbacks {
+                let mut pending = self.pending_error.borrow_mut();
+                if pending.is_none() {
+                    *pending = Some(error);
+                }
+            }
+            return outcome;
+        }
+        match callbacks {
+            Err(error @ Error::Tls(_)) => Err(error),
+            callbacks => outcome.and_then(|value| callbacks.map(|_| value)),
+        }
+    }
     /// Queries from callbacks reuse the active drive without recursive dispatch.
     pub fn query<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         let guard = if self.active.get() {
@@ -234,14 +274,7 @@ impl Core {
         }
     }
     pub fn observe(&self, m: &Message) {
-        let callback = self.callbacks.borrow_mut().consume.take();
-        if let Some(mut cb) = callback {
-            cb(m);
-            let mut state = self.callbacks.borrow_mut();
-            if state.consume.is_none() {
-                state.consume = Some(cb);
-            }
-        }
+        with_callback(&self.callbacks, |state| &mut state.consume, |cb| cb(m));
     }
     pub fn operation(
         &self,
@@ -274,7 +307,7 @@ impl Core {
             )
             .map_err(Error::from)
         })?;
-        Ok(Metadata {
+        let metadata = Metadata {
             brokers: m
                 .broker_ids
                 .into_iter()
@@ -302,7 +335,19 @@ impl Core {
                 })
                 .collect(),
             _thread: Default::default(),
-        })
+        };
+        let mut counts = self.partition_counts.borrow_mut();
+        if let Some(topic) = topic {
+            counts.remove(topic);
+        } else {
+            counts.clear();
+        }
+        for topic in &metadata.topics {
+            if topic.error == 0 && !topic.partitions.is_empty() {
+                counts.insert(topic.name.clone(), topic.partitions.len() as i32);
+            }
+        }
+        Ok(metadata)
     }
 }
 

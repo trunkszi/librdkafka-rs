@@ -2,6 +2,8 @@
 
 use std::{
     fs,
+    hash::{Hash, Hasher},
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -35,12 +37,51 @@ fn replace(source: &str, from: &str, to: &str) -> String {
     source.replace(from, to)
 }
 
+fn hash_tree(source: &Path, hasher: &mut impl Hasher) {
+    let mut entries: Vec<_> = fs::read_dir(source)
+        .expect("read source fingerprint directory")
+        .map(|entry| entry.expect("read source fingerprint entry"))
+        .filter(|entry| entry.file_name() != ".git")
+        .collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        entry.file_name().hash(hasher);
+        let path = entry.path();
+        if entry.file_type().expect("source fingerprint type").is_dir() {
+            true.hash(hasher);
+            hash_tree(&path, hasher);
+        } else {
+            false.hash(hasher);
+            let mut file = fs::File::open(path).expect("open native source fingerprint");
+            let mut bytes = [0u8; 16384];
+            loop {
+                let count = file
+                    .read(&mut bytes)
+                    .expect("read native source fingerprint");
+                if count == 0 {
+                    break;
+                }
+                hasher.write(&bytes[..count]);
+            }
+            file.metadata()
+                .expect("source fingerprint metadata")
+                .len()
+                .hash(hasher);
+        }
+    }
+}
+
 pub fn source(source: &Path, out: &Path, manifest: &Path) -> PathBuf {
     let private = out.join("sasl-native-source");
     let marker = private.join(".rdkafka-rs-source-ready");
     let identity = source.canonicalize().expect("resolve native source path");
-    let identity = identity.to_string_lossy();
-    if fs::read_to_string(&marker).ok().as_deref() != Some(identity.as_ref()) {
+    let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+    hash_tree(source, &mut fingerprint);
+    let identity = format!("{}:{:016x}", identity.display(), fingerprint.finish());
+    if fs::read_to_string(&marker).ok().as_deref() != Some(identity.as_str()) {
+        if private.exists() {
+            fs::remove_dir_all(&private).expect("remove stale private native source");
+        }
         copy_tree(source, &private);
         fs::write(marker, identity.as_bytes()).expect("mark private native source complete");
     }
@@ -137,4 +178,32 @@ pub fn source(source: &Path, out: &Path, manifest: &Path) -> PathBuf {
         .expect("read native SASL crypto adapter");
     write_changed(&private.join("src/sasl_crypto.h"), &header);
     private
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_scenario_source_fingerprint_detects_edits_and_removed_files() {
+        let path = std::env::temp_dir().join(format!("rdkafka-source-hash-{}", std::process::id()));
+        fs::create_dir_all(&path).expect("create source fixture");
+        let fingerprint = || {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hash_tree(&path, &mut hasher);
+            hasher.finish()
+        };
+        fs::write(path.join("source.c"), b"original").expect("initial source");
+        let original = fingerprint();
+        fs::write(path.join("source.c"), b"modified").expect("source edit");
+        assert_ne!(original, fingerprint());
+        fs::write(path.join("source.c"), b"original").expect("restore fixture contents");
+        assert_eq!(original, fingerprint());
+        fs::write(path.join("removed.h"), b"header").expect("extra source");
+        let extra = fingerprint();
+        fs::remove_file(path.join("removed.h")).expect("delete fixture header");
+        assert_ne!(extra, fingerprint());
+        assert_eq!(original, fingerprint());
+        fs::remove_dir_all(path).expect("remove source fixture");
+    }
 }

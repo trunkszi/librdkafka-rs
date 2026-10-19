@@ -340,3 +340,65 @@ fn e2e_lifecycle_live_typed_and_serde_native_batches() -> Result<()> {
     success(admin.delete_topics(&[&name], TIMEOUT)?);
     Ok(())
 }
+
+#[test]
+#[ignore = "requires an explicitly provisioned Redpanda broker"]
+fn e2e_lifecycle_live_partitioner_observes_topic_expansion_after_metadata_refresh() -> Result<()> {
+    let brokers = brokers();
+    let admin = admin(&brokers)?;
+    let name = unique("partitioner-expansion");
+    topic(&admin, &name, 1)?;
+    let counts = Rc::new(RefCell::new(Vec::new()));
+    let captured = Rc::clone(&counts);
+    let mut config = config(&brokers)?;
+    config.partitioner_cb(move |_, _, count| {
+        captured.borrow_mut().push(count);
+        count - 1
+    });
+    let p = Producer::new(&config)?;
+    p.produce(ProduceRecord::new(&name, Some(b"before-expansion")))?;
+    p.flush(TIMEOUT)?;
+    assert_eq!(*counts.borrow(), [1]);
+    success(admin.create_partitions(
+        &[NewPartitions {
+            topic: name.clone(),
+            total_count: 3,
+        }],
+        TIMEOUT,
+    )?);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let metadata = p.metadata(Some(&name), TIMEOUT)?;
+        if metadata
+            .topics
+            .iter()
+            .any(|topic| topic.name == name && topic.partitions.len() == 3)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expanded metadata did not become visible"
+        );
+    }
+    p.produce(ProduceRecord::new(&name, Some(b"after-expansion")))?;
+    p.flush(TIMEOUT)?;
+    assert_eq!(*counts.borrow(), [1, 3]);
+    let c = consumer(&brokers, &unique("expanded-reader"))?;
+    c.assign(&[TopicPartition::new(&name, 2, 0)])?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(message) = c.consume(100)? {
+            assert_eq!(message.partition, 2);
+            assert_eq!(message.payload.as_deref(), Some(&b"after-expansion"[..]));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expanded partition did not receive record"
+        );
+    }
+    c.close()?;
+    success(admin.delete_topics(&[&name], TIMEOUT)?);
+    Ok(())
+}

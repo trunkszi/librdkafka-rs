@@ -1,55 +1,56 @@
 #include "src/shim.h"
 #include "rdkafka-sys/src/tls_callbacks.h"
 #include "rdkafka-sys/src/lib.rs.h"
+#include <cerrno>
+#include <unistd.h>
+#include <thread>
 #include <array>
 #include <fcntl.h>
 #include <rdkafka_mock.h>
 #include <stdexcept>
 #include <sys/socket.h>
 namespace kafka_bridge {
-// Sequence-tagged slots prevent producers from publishing partially written
-// events.
+// Producers publish into a linked MPSC FIFO; only the caller thread drains it.
+// Native handles stop their callback producers before this queue is destroyed.
 struct EventQueue {
   static constexpr size_t capacity = 4096;
-  struct Slot {
-    std::atomic<size_t> sequence;
-    NativeEvent value;
+  struct Node {
+    std::atomic<Node *> next{nullptr};
+    NativeEvent value{};
+    Node() = default;
+    explicit Node(NativeEvent event) : value(std::move(event)) {}
   };
-  std::array<Slot, capacity> slots;
-  std::atomic<size_t> enqueue{0};
-  size_t dequeue = 0;
-  std::atomic<bool> overflow{false};
-  EventQueue() {
-    for (size_t i = 0; i < capacity; ++i)
-      slots[i].sequence.store(i, std::memory_order_relaxed);
-  }
-  void push(NativeEvent event) {
-    size_t pos = enqueue.load(std::memory_order_relaxed);
-    for (;;) {
-      auto &slot = slots[pos % capacity];
-      auto seq = slot.sequence.load(std::memory_order_acquire);
-      auto difference = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
-      if (difference == 0) {
-        if (enqueue.compare_exchange_weak(pos, pos + 1,
-                                          std::memory_order_relaxed)) {
-          slot.value = std::move(event);
-          slot.sequence.store(pos + 1, std::memory_order_release);
-          return;
-        }
-      } else if (difference < 0) {
-        overflow.store(true, std::memory_order_release);
-        return;
-      } else
-        pos = enqueue.load(std::memory_order_relaxed);
+  Node *head = new Node();
+  std::atomic<Node *> tail{head};
+  std::atomic<size_t> logs{0};
+  ~EventQueue() {
+    while (head) {
+      auto *next = head->next.load(std::memory_order_relaxed);
+      delete head;
+      head = next;
     }
   }
+  void push(NativeEvent event) {
+    auto node = std::make_unique<Node>(std::move(event));
+    const bool log = node->value.kind == 1 + RdKafka::Event::EVENT_LOG;
+    if (log && logs.fetch_add(1, std::memory_order_relaxed) >= capacity) {
+      logs.fetch_sub(1, std::memory_order_relaxed);
+      return;
+    }
+    auto *next = node.release();
+    // Exchange orders producers; release-link publishes the initialized node.
+    auto *previous = tail.exchange(next, std::memory_order_acq_rel);
+    previous->next.store(next, std::memory_order_release);
+  }
   bool pop(NativeEvent &event) {
-    auto &slot = slots[dequeue % capacity];
-    if (slot.sequence.load(std::memory_order_acquire) != dequeue + 1)
-      return false;
-    event = std::move(slot.value);
-    slot.sequence.store(dequeue + capacity, std::memory_order_release);
-    ++dequeue;
+    auto *next = head->next.load(std::memory_order_acquire);
+    if (!next) return false;
+    // Acquiring the link also proves its producer has finished using head.
+    event = std::move(next->value);
+    delete head;
+    head = next;
+    if (event.kind == 1 + RdKafka::Event::EVENT_LOG)
+      logs.fetch_sub(1, std::memory_order_relaxed);
     return true;
   }
 };
@@ -93,15 +94,6 @@ rust::Vec<NativeEvent> Callbacks::drain() {
   NativeEvent event;
   while (events->pop(event))
     out.push_back(std::move(event));
-  if (events->overflow.exchange(false, std::memory_order_acq_rel))
-    out.push_back({12,
-                   RD_KAFKA_RESP_ERR__QUEUE_FULL,
-                   "NATIVE_OBSERVER_QUEUE_OVERFLOW",
-                   "",
-                   -1,
-                   -1,
-                   0,
-                   {}});
   return out;
 }
 void Callbacks::dr_cb(RdKafka::Message &m) {
@@ -216,17 +208,88 @@ int32_t Callbacks::partitioner_cb(const RdKafka::Topic *t, const void *key,
   return rd_kafka_msg_partitioner_consistent_random(
       const_cast<RdKafka::Topic *>(t)->c_ptr(), key, len, n, nullptr, nullptr);
 }
+static int cloexec(int fd) {
+  if (fd < 0) return fd;
+  const int flags = fcntl(fd, F_GETFD);
+  if (flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) >= 0) return fd;
+  const int error = errno;
+  ::close(fd);
+  errno = error;
+  return -1;
+}
+static int fallback_socket(int domain, int type, int protocol) {
+#ifdef SOCK_CLOEXEC
+  int fd = ::socket(domain, type | SOCK_CLOEXEC, protocol);
+  if (fd >= 0 || errno != EINVAL) return fd;
+#endif
+  return cloexec(::socket(domain, type, protocol));
+}
+static int fallback_open(const std::string &path, int flags, int mode) {
+#ifdef O_CLOEXEC
+  int fd = ::open(path.c_str(), flags | O_CLOEXEC, mode);
+  if (fd >= 0 || errno != EINVAL) return fd;
+#endif
+  return cloexec(::open(path.c_str(), flags, mode));
+}
+bool native_callback_contract_test() {
+  Callbacks callbacks;
+  for (int kind : {0, 1, 5, 6, 7, 10, 13})
+    for (uint64_t i = 0; i < 5000; ++i)
+      callbacks.record(kind, 0, "", "", -1, -1, i);
+  auto events = callbacks.drain();
+  if (events.size() != 35000) return false;
+  for (size_t i = 0; i < events.size(); ++i)
+    if (events[i].token != i % 5000) return false;
+  std::atomic<int> remaining{4};
+  std::vector<std::thread> producers;
+  for (int producer = 0; producer < 4; ++producer) {
+    producers.emplace_back([&, producer] {
+      for (uint64_t i = 0; i < 5000; ++i)
+        callbacks.record(0, producer, "", "", -1, -1, i);
+      remaining.fetch_sub(1, std::memory_order_release);
+    });
+  }
+  std::array<uint64_t, 4> received{};
+  bool ordered = true;
+  auto consume = [&] {
+    for (const auto &event : callbacks.drain()) {
+      if (event.code < 0 || event.code >= 4) { ordered = false; continue; }
+      if (event.token != received[event.code]++) ordered = false;
+    }
+  };
+  while (remaining.load(std::memory_order_acquire)) {
+    consume();
+    std::this_thread::yield();
+  }
+  for (auto &producer : producers) producer.join();
+  consume();
+  if (!ordered) return false;
+  for (auto count : received) if (count != 5000) return false;
+  for (int i = 0; i < 6000; ++i)
+    callbacks.record(1 + RdKafka::Event::EVENT_LOG, 0, "log");
+  callbacks.record(13, 0, "TLS failure");
+  auto bounded = callbacks.drain();
+  if (bounded.size() != 4097 || bounded[bounded.size() - 1].kind != 13) return false;
+  const int socket = callbacks.socket_cb(AF_UNIX, SOCK_STREAM, 0);
+  const int file = callbacks.open_cb("/dev/null", O_RDONLY, 0);
+  const bool valid = socket >= 0 && file >= 0 &&
+      (fcntl(socket, F_GETFD) & FD_CLOEXEC) &&
+      (fcntl(file, F_GETFD) & FD_CLOEXEC);
+  if (socket >= 0) ::close(socket);
+  if (file >= 0) ::close(file);
+  return valid;
+}
 int Callbacks::socket_cb(int domain, int type, int protocol) {
   record(8, domain, "socket", "", type, protocol);
   auto result = hooks_socket(*hooks, domain, type, protocol);
-  auto fd = result == -2 ? ::socket(domain, type, protocol) : result;
+  auto fd = result == -2 ? fallback_socket(domain, type, protocol) : result;
   tls_track_socket(fd, *this);
   return fd;
 }
 int Callbacks::open_cb(const std::string &path, int flags, int mode) {
   record(9, flags, path, "", mode);
   auto result = hooks_open(*hooks, path, flags, mode);
-  return result == -2 ? ::open(path.c_str(), flags, mode) : result;
+  return result == -2 ? fallback_open(path, flags, mode) : result;
 }
 // The adapter borrows a native topic only while librdkafka owns the callback.
 // Its opaque pointer is callback state, never a destructible C++ Topic wrapper.
@@ -291,6 +354,10 @@ rust::Vec<NativeProperty> conf_dump(const Conf &c) {
   return out;
 }
 std::unique_ptr<Client> client_new(const Conf &c, int32_t kind) {
+  return client_new_with_partitioner(c, kind, false);
+}
+std::unique_ptr<Client> client_new_with_partitioner(const Conf &c, int32_t kind,
+                                                     bool has_partitioner) {
   if (c.topic || kind < 0 || kind > 2)
     throw std::runtime_error(
         "global configuration and valid client kind required");
@@ -306,6 +373,7 @@ std::unique_ptr<Client> client_new(const Conf &c, int32_t kind) {
   auto &cb = out->state->callbacks;
   cb.hooks = hooks_clone(*c.hooks);
   cb.manual_rebalance = c.rebalance_observer;
+  cb.has_partitioner = has_partitioner;
   if (hooks_tls_enabled(*cb.hooks)) tls_install_callbacks(cfg->c_ptr_global());
   auto check = [&](auto ptr, const char *name) {
     if (cfg->set(name, ptr, e) != RdKafka::Conf::CONF_OK)
@@ -325,7 +393,7 @@ std::unique_ptr<Client> client_new(const Conf &c, int32_t kind) {
   }
   if (cfg->set("log.queue", "true", e) != RdKafka::Conf::CONF_OK)
     throw std::runtime_error(e);
-  if (kind == 0) {
+  if (kind == 0 && has_partitioner) {
     auto *topic_conf =
         rd_kafka_conf_get_default_topic_conf(cfg->c_ptr_global());
     auto *copy = topic_conf ? rd_kafka_topic_conf_dup(topic_conf)

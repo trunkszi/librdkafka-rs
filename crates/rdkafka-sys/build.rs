@@ -83,6 +83,7 @@ fn cache_dir(manifest: &Path, out: &Path) -> PathBuf {
 fn kafka_source(manifest: &Path, cache: &Path) -> PathBuf {
     if let Some(configured) = env::var_os("LIBRDKAFKA_DIR") {
         let source = PathBuf::from(configured);
+        println!("cargo:rerun-if-changed={}", source.display());
         assert!(
             source.join("src-cpp/rdkafkacpp.h").is_file(),
             "invalid LIBRDKAFKA_DIR"

@@ -233,8 +233,10 @@ std::unique_ptr<Topic> topic_new(Client &c, rust::Str name, const Conf &conf) {
     if (cfg->set(p.first, p.second, e) != RdKafka::Conf::CONF_OK)
       throw std::runtime_error(e);
   auto *native = rd_kafka_topic_conf_dup(cfg->c_ptr_topic());
-  rd_kafka_topic_conf_set_opaque(native, &c.state->callbacks);
-  rd_kafka_topic_conf_set_partitioner_cb(native, partitioner_string);
+  if (c.state->callbacks.has_partitioner) {
+    rd_kafka_topic_conf_set_opaque(native, &c.state->callbacks);
+    rd_kafka_topic_conf_set_partitioner_cb(native, partitioner_string);
+  }
   auto topic = std::make_unique<Topic>();
   topic->owner = c.state;
   std::string topic_name(name);
@@ -243,6 +245,11 @@ std::unique_ptr<Topic> topic_new(Client &c, rust::Str name, const Conf &conf) {
     throw std::runtime_error(std::to_string(rd_kafka_last_error()) + ":" +
                              rd_kafka_err2str(rd_kafka_last_error()));
   return topic;
+}
+int32_t topic_murmur2_partition(const Topic &t, rust::Slice<const uint8_t> key,
+                                 int32_t count) {
+  return rd_kafka_msg_partitioner_murmur2_random(t.value, key.data(), key.size(),
+                                                count, nullptr, nullptr);
 }
 rust::String topic_name(const Topic &t) { return rd_kafka_topic_name(t.value); }
 bool topic_available(const Topic &t, int32_t p) {

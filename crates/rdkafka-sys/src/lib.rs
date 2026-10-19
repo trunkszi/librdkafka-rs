@@ -96,6 +96,9 @@ pub mod ffi {
         type Queue;
         type Topic;
         type Message;
+        fn native_callback_contract_test() -> bool;
+        fn queue_retains_forwarded_owner(queue: &Queue) -> bool;
+        fn topic_murmur2_partition(topic: &Topic, key: &[u8], count: i32) -> i32;
         fn conf_new(topic: bool) -> UniquePtr<Conf>;
         /// # Errors
         /// Returns the native diagnostic when configuration or the operation fails.
@@ -120,6 +123,13 @@ pub mod ffi {
         /// # Errors
         /// Returns the native diagnostic when configuration or the operation fails.
         fn client_new(conf: &Conf, kind: i32) -> Result<UniquePtr<Client>>;
+        /// # Errors
+        /// Returns the native diagnostic when client configuration is invalid.
+        fn client_new_with_partitioner(
+            conf: &Conf,
+            kind: i32,
+            has_partitioner: bool,
+        ) -> Result<UniquePtr<Client>>;
         fn client_poll(client: Pin<&mut Client>, timeout: i32) -> Vec<NativeEvent>;
         fn client_flush(client: Pin<&mut Client>, timeout: i32) -> i32;
         fn client_outq(client: &Client) -> i32;

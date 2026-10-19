@@ -92,3 +92,32 @@ pub(crate) struct Callbacks {
     pub open: Option<OpenCb>,
     pub oauth: Option<OAuthBearerTokenRefreshCb>,
 }
+
+/// Restores a temporarily borrowed callback, including during user unwinding.
+pub(crate) fn with_callback<T, R>(
+    callbacks: &std::cell::RefCell<Callbacks>,
+    slot: fn(&mut Callbacks) -> &mut Option<T>,
+    invoke: impl FnOnce(&mut T) -> R,
+) -> Option<R> {
+    struct Restore<'a, T> {
+        callbacks: &'a std::cell::RefCell<Callbacks>,
+        slot: fn(&mut Callbacks) -> &mut Option<T>,
+        callback: Option<T>,
+    }
+    impl<T> Drop for Restore<'_, T> {
+        fn drop(&mut self) {
+            let mut state = self.callbacks.borrow_mut();
+            let slot = (self.slot)(&mut state);
+            if slot.is_none() {
+                *slot = self.callback.take();
+            }
+        }
+    }
+    let callback = slot(&mut callbacks.borrow_mut()).take();
+    let mut restore = Restore {
+        callbacks,
+        slot,
+        callback,
+    };
+    restore.callback.as_mut().map(invoke)
+}
