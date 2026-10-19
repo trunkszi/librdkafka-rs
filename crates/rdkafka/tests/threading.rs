@@ -58,7 +58,6 @@ fn integration_scenario_worker_factory_failure_rolls_back_and_retries() -> Resul
     let fail = Rc::new(Cell::new(true));
     let drops = Rc::new(Cell::new(0));
     let manager = WorkerClient::new(3, WorkerBalance::RoundRobin, {
-        let fail = fail.clone();
         let drops = drops.clone();
         move |index| {
             if index == 1 && fail.replace(false) {
@@ -198,7 +197,7 @@ fn integration_lifecycle_managers_create_and_destroy_on_two_calling_os_threads()
             let workers = workers.clone();
             thread::spawn(move || {
                 let manager = factory.clone();
-                let worker = workers.clone();
+                let worker = workers;
                 for _ in 0..2 {
                     manager
                         .with(|client| {
@@ -305,7 +304,7 @@ fn integration_lifecycle_manager_clones_share_one_client() -> Result<()> {
     drop(third);
     factory.reset()?;
     assert_eq!(drops.get(), 2);
-    assert_eq!(factory.clone().with(|client| Ok(client.index))?, 3);
+    assert_eq!(factory.with(|client| Ok(client.index))?, 3);
     factory.reset()?;
     assert_eq!(drops.get(), 3);
     Ok(())
