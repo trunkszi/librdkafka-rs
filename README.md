@@ -134,13 +134,16 @@ and schema language/definition; latest-version requests reach the registry.
 `encode_confluent` replaces a caller-owned byte buffer with the magic byte,
 big-endian schema ID, and payload; `decode_confluent` borrows the payload.
 
-`ThreadLocalFactory` and `WorkerFactory` share factory configuration between OS
-threads while producing `!Send + !Sync` local managers. Repeated `local()` calls
-and cloned factories share one lazy pool on each OS thread. `WorkerBalance`
+`ThreadLocalClient` and `WorkerClient` are shareable managers when their factory
+is `Send + Sync`. Share a reference or an `Arc` directly across OS threads; each
+thread lazily creates its own `!Send + !Sync` client or slot pool. Clones share
+manager identity and the local pool. `WorkerBalance`
 supports round robin, least-in-flight, and FNV-1a key routing. Fallible leases and
-RAII restore local ownership after callback failure or panic. `reset()` releases
-the current pool; call it explicitly if clients retain their manager and create
-an ownership cycle. No client state crosses a thread boundary.
+RAII restore local ownership after callback failure or panic. Public
+`WorkerSlotLease` guards dereference to the client, remain `!Send + !Sync`, and
+release their slots on drop. `reset()` releases only the calling thread's pool;
+call it explicitly if clients retain their manager and create an ownership cycle. After the last manager drops, remote caches are reclaimed
+on their next manager access or thread exit. No client state crosses threads.
 
 HTTP tests include real HTTP/2/rustls, mTLS, OIDC, and an isolated Docker Redpanda
 Schema Registry. The live test starts and removes its own container unless

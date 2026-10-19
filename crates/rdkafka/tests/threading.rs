@@ -8,9 +8,7 @@ use std::{
 
 use rdkafka::{
     Error, Result,
-    threading::{
-        ThreadLocalClient, ThreadLocalFactory, WorkerBalance, WorkerClient, WorkerFactory,
-    },
+    threading::{ThreadLocalClient, WorkerBalance, WorkerClient},
 };
 
 struct Client {
@@ -162,7 +160,7 @@ fn unit_scenario_fnv1a_key_routing_and_busy_key_rejection() -> Result<()> {
 }
 
 #[test]
-fn integration_lifecycle_factories_create_and_destroy_on_two_calling_os_threads() {
+fn integration_lifecycle_managers_create_and_destroy_on_two_calling_os_threads() {
     struct LocalClient {
         owner: ThreadId,
         drops: Arc<Mutex<Vec<ThreadId>>>,
@@ -176,7 +174,7 @@ fn integration_lifecycle_factories_create_and_destroy_on_two_calling_os_threads(
     }
     let created = Arc::new(Mutex::new(Vec::new()));
     let dropped = Arc::new(Mutex::new(Vec::new()));
-    let factory = ThreadLocalFactory::new({
+    let factory = ThreadLocalClient::new({
         let created = created.clone();
         let drops = dropped.clone();
         move || {
@@ -188,8 +186,9 @@ fn integration_lifecycle_factories_create_and_destroy_on_two_calling_os_threads(
                 _local: Rc::new(()),
             })
         }
-    });
-    let workers = WorkerFactory::new(2, WorkerBalance::RoundRobin, |index| {
+    })
+    .unwrap();
+    let workers = WorkerClient::new(2, WorkerBalance::RoundRobin, |index| {
         Ok((index, thread::current().id(), Rc::new(())))
     })
     .unwrap();
@@ -198,8 +197,8 @@ fn integration_lifecycle_factories_create_and_destroy_on_two_calling_os_threads(
             let factory = factory.clone();
             let workers = workers.clone();
             thread::spawn(move || {
-                let manager = factory.local().unwrap();
-                let worker = workers.local().unwrap();
+                let manager = factory.clone();
+                let worker = workers.clone();
                 for _ in 0..2 {
                     manager
                         .with(|client| {
@@ -273,10 +272,10 @@ fn integration_lifecycle_reset_releases_client_retained_manager_clone() -> Resul
 }
 
 #[test]
-fn integration_lifecycle_repeated_factory_local_calls_share_one_client() -> Result<()> {
+fn integration_lifecycle_manager_clones_share_one_client() -> Result<()> {
     let created = Rc::new(Cell::new(0));
     let drops = Rc::new(Cell::new(0));
-    let factory = ThreadLocalFactory::new({
+    let factory = ThreadLocalClient::new({
         let created = created.clone();
         let drops = drops.clone();
         move || {
@@ -287,9 +286,9 @@ fn integration_lifecycle_repeated_factory_local_calls_share_one_client() -> Resu
                 drops: drops.clone(),
             })
         }
-    });
-    let first = factory.local()?;
-    let second = factory.clone().local()?;
+    })?;
+    let first = factory.clone();
+    let second = factory.clone();
     assert_eq!(first.with(|client| Ok(client.index))?, 1);
     assert_eq!(second.with(|client| Ok(client.index))?, 1);
     drop(first);
@@ -298,23 +297,25 @@ fn integration_lifecycle_repeated_factory_local_calls_share_one_client() -> Resu
     assert_eq!(created.get(), 1);
     second.reset()?;
     assert_eq!(drops.get(), 1);
-    let third = factory.local()?;
+    let third = factory.clone();
     assert_eq!(third.with(|client| Ok(client.index))?, 2);
     assert_eq!(second.with(|client| Ok(client.index))?, 2);
     drop(second);
     assert_eq!(drops.get(), 1);
     drop(third);
+    factory.reset()?;
     assert_eq!(drops.get(), 2);
-    assert_eq!(factory.local()?.with(|client| Ok(client.index))?, 3);
+    assert_eq!(factory.clone().with(|client| Ok(client.index))?, 3);
+    factory.reset()?;
     assert_eq!(drops.get(), 3);
     Ok(())
 }
 
 #[test]
-fn integration_lifecycle_repeated_worker_factory_local_calls_share_slots() -> Result<()> {
+fn integration_lifecycle_worker_clones_share_slots() -> Result<()> {
     let created = Rc::new(Cell::new(0));
     let drops = Rc::new(Cell::new(0));
-    let factory = WorkerFactory::new(2, WorkerBalance::RoundRobin, {
+    let factory = WorkerClient::new(2, WorkerBalance::RoundRobin, {
         let created = created.clone();
         let drops = drops.clone();
         move |index| {
@@ -326,15 +327,15 @@ fn integration_lifecycle_repeated_worker_factory_local_calls_share_slots() -> Re
             })
         }
     })?;
-    let first = factory.local()?;
-    let second = factory.clone().local()?;
+    let first = factory.clone();
+    let second = factory.clone();
     assert_eq!(first.with(|client| Ok(client.index))?, 0);
     assert_eq!(second.with(|client| Ok(client.index))?, 1);
     assert_eq!(created.get(), 2);
     drop(first);
     assert_eq!(drops.get(), 0);
     assert_eq!(second.with(|client| Ok(client.index))?, 0);
-    let third = factory.local()?;
+    let third = factory.clone();
     second.reset()?;
     assert_eq!(drops.get(), 2);
     assert_eq!(third.with(|client| Ok(client.index))?, 0);
@@ -343,6 +344,146 @@ fn integration_lifecycle_repeated_worker_factory_local_calls_share_slots() -> Re
     drop(second);
     assert_eq!(drops.get(), 2);
     drop(third);
+    factory.reset()?;
     assert_eq!(drops.get(), 4);
+    Ok(())
+}
+
+#[test]
+fn integration_lifecycle_shared_reference_and_arc_keep_clients_thread_local() -> Result<()> {
+    let manager =
+        rdkafka::ThreadLocalProducer::new(|| Ok((thread::current().id(), Rc::new(Cell::new(0)))))?;
+    let workers = Arc::new(rdkafka::WorkerProducer::new(
+        2,
+        WorkerBalance::RoundRobin,
+        |index| Ok((thread::current().id(), index, Rc::new(Cell::new(0)))),
+    )?);
+    let barrier = std::sync::Barrier::new(2);
+    thread::scope(|scope| {
+        let handles = (0..2)
+            .map(|_| {
+                let manager = &manager;
+                let workers = workers.clone();
+                let barrier = &barrier;
+                scope.spawn(move || -> Result<()> {
+                    barrier.wait();
+                    for expected in 0..3 {
+                        manager.with(|client| {
+                            assert_eq!(client.0, thread::current().id());
+                            assert_eq!(client.1.get(), expected);
+                            client.1.set(expected + 1);
+                            Ok(())
+                        })?;
+                    }
+                    let mut first = workers.lease()?;
+                    let mut second = workers.lease()?;
+                    assert_eq!((first.1, second.1), (0, 1));
+                    assert_eq!(first.0, thread::current().id());
+                    assert_eq!(second.0, thread::current().id());
+                    assert!(!Rc::ptr_eq(&first.2, &second.2));
+                    first.1 = 11;
+                    second.1 = 22;
+                    assert!(workers.lease().is_err());
+                    assert!(workers.reset().is_err());
+                    drop(first);
+                    drop(second);
+                    assert_eq!(workers.lease()?.1, 11);
+                    workers.reset()?;
+                    manager.reset()?;
+                    Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap()?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn integration_lifecycle_public_lease_survives_manager_and_releases_on_unwind() -> Result<()> {
+    let drops = Rc::new(Cell::new(0));
+    let manager = WorkerClient::new(1, WorkerBalance::KeyHash, {
+        let drops = drops.clone();
+        move |index| {
+            Ok(Client {
+                index,
+                owner: thread::current().id(),
+                drops: drops.clone(),
+            })
+        }
+    })?;
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let mut lease = manager.lease_keyed(b"key").unwrap();
+        lease.index = 23;
+        assert!(manager.lease_keyed(b"key").is_err());
+        panic!("lease owner panicked");
+    }));
+    assert!(outcome.is_err());
+    let mut lease = manager.lease_keyed(b"key")?;
+    assert_eq!(lease.index, 23);
+    lease.index = 24;
+    let metrics = manager.metrics()?;
+    assert_eq!(
+        (
+            metrics[0].dispatched,
+            metrics[0].completed,
+            metrics[0].in_flight
+        ),
+        (2, 1, 1)
+    );
+    drop(manager);
+    assert_eq!(drops.get(), 0);
+    assert_eq!(lease.index, 24);
+    drop(lease);
+    assert_eq!(drops.get(), 1);
+    Ok(())
+}
+
+#[test]
+fn integration_lifecycle_remote_cache_reclaimed_on_owning_thread() -> Result<()> {
+    struct Owned {
+        owner: ThreadId,
+        drops: Arc<Mutex<Vec<ThreadId>>>,
+        _local: Rc<()>,
+    }
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            assert_eq!(self.owner, thread::current().id());
+            self.drops.lock().unwrap().push(self.owner);
+        }
+    }
+    let drops = Arc::new(Mutex::new(Vec::new()));
+    let manager = Arc::new(ThreadLocalClient::new({
+        let drops = drops.clone();
+        move || {
+            Ok(Owned {
+                owner: thread::current().id(),
+                drops: drops.clone(),
+                _local: Rc::new(()),
+            })
+        }
+    })?);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let worker = {
+        let manager = manager.clone();
+        thread::spawn(move || -> Result<()> {
+            manager.with(|_| Ok(()))?;
+            drop(manager);
+            ready_tx.send(thread::current().id()).unwrap();
+            resume_rx.recv().unwrap();
+            let other = ThreadLocalClient::new(|| Ok(Rc::new(())))?;
+            other.with(|_| Ok(()))?;
+            Ok(())
+        })
+    };
+    let owner = ready_rx.recv().unwrap();
+    drop(manager);
+    assert!(drops.lock().unwrap().is_empty());
+    resume_tx.send(()).unwrap();
+    worker.join().unwrap()?;
+    assert_eq!(*drops.lock().unwrap(), vec![owner]);
     Ok(())
 }
