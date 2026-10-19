@@ -202,3 +202,135 @@ fn integration_scenario_serde_batch_and_default_custom_codec() -> Result<()> {
     assert_eq!(batch.get(0).unwrap().payload, Some(&b"19"[..]));
     producer.flush(10000)
 }
+
+#[test]
+fn integration_scenario_received_codec_errors_preserve_prefix_and_retry() -> Result<()> {
+    let mut conf = Conf::new();
+    conf.set("test.mock.num.brokers", "1")?;
+    conf.partitioner_cb(|_, _, _| 0);
+    let producer = Producer::new(&conf)?;
+    let topic = format!("codec-failures-{}", std::process::id());
+    let mut wire = WireBatch::new();
+    let mut scratch = Vec::new();
+    assert!(
+        producer
+            .produce_batch_using(
+                &topic,
+                &[11_u64, 22, 33],
+                &mut wire,
+                &mut scratch,
+                encode_number,
+            )?
+            .all_accepted()
+    );
+    producer.flush(10000)?;
+    let receiver = consumer(&producer.mock_bootstraps(), &topic)?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let received = loop {
+        let received = receiver.consume_batch(3, 500)?;
+        if !received.is_empty() {
+            break received;
+        }
+        assert!(Instant::now() < deadline, "codec failure receive deadline");
+    };
+    assert_eq!(received.len(), 3);
+    let fail_second = |payload: &[u8]| {
+        if payload == b"22" {
+            Err(Error::Codec("decoder record 2".into()))
+        } else {
+            decode_number(payload)
+        }
+    };
+    let mut prefix = vec![100_u64];
+    let error = received.decode_into_using(&mut prefix, fail_second);
+    assert!(matches!(error, Err(Error::Codec(message)) if message == "decoder record 2"));
+    assert_eq!(prefix, [100, 11]);
+    let mut slots = [101_u64, 202, 303, 404];
+    let error = received.decode_into_slice_using(&mut slots, fail_second);
+    assert!(matches!(error, Err(Error::Codec(message)) if message == "decoder record 2"));
+    assert_eq!(slots, [11, 202, 303, 404]);
+    let mut visited = vec![];
+    let error = received.decode_with_using(decode_number, |value| {
+        if value == 22 {
+            return Err(Error::Codec("visitor record 2".into()));
+        }
+        visited.push(value);
+        Ok(())
+    });
+    assert!(matches!(error, Err(Error::Codec(message)) if message == "visitor record 2"));
+    assert_eq!(visited, [11]);
+    assert_eq!(received.get(1)?.unwrap().payload, Some(&b"22"[..]));
+    assert_eq!(received.get(2)?.unwrap().payload, Some(&b"33"[..]));
+    let mut wire_prefix = vec![];
+    let error = received.visit_from(0, |index, record| {
+        if index == 1 {
+            return Err(Error::Codec("wire visitor record 2".into()));
+        }
+        wire_prefix.push(decode_number(record.payload.unwrap())?);
+        Ok(())
+    });
+    assert!(matches!(error, Err(Error::Codec(message)) if message == "wire visitor record 2"));
+    assert_eq!(wire_prefix, [11]);
+    assert_eq!(
+        received.visit_from(1, |_, record| {
+            wire_prefix.push(decode_number(record.payload.unwrap())?);
+            Ok(())
+        })?,
+        2
+    );
+    assert_eq!(wire_prefix, [11, 22, 33]);
+    receiver.close()?;
+    Ok(())
+}
+
+#[test]
+fn integration_scenario_encoder_unwind_bounds_scratch_before_native_enqueue() -> Result<()> {
+    let mut conf = Conf::new();
+    conf.set("test.mock.num.brokers", "1")?;
+    let deliveries = std::rc::Rc::new(std::cell::Cell::new(0));
+    let observed = std::rc::Rc::clone(&deliveries);
+    conf.delivery_report_cb(move |_| observed.set(observed.get() + 1));
+    let producer = Producer::new(&conf)?;
+    producer.flush(1000)?;
+    assert_eq!(producer.outq_len(), 0);
+    let topic = format!("codec-unwind-{}", std::process::id());
+    let mut batch = WireBatch::new();
+    let mut scratch = Vec::new();
+    let policy = BufferPolicy {
+        max_records: 4,
+        max_bytes: 64,
+    };
+    let mut calls = 0;
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        producer.produce_batch_using_with_policy(
+            &topic,
+            &[11_u64, 22, 33],
+            &mut batch,
+            &mut scratch,
+            policy,
+            |value, output| {
+                calls += 1;
+                if calls == 2 {
+                    output.resize(1024 * 1024, 0);
+                    panic!("encoder record 2");
+                }
+                encode_number(value, output)
+            },
+        )
+    }));
+    let payload = panic.expect_err("second encoder must unwind");
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"encoder record 2"));
+    assert_eq!(calls, 2, "third record must remain unencoded");
+    assert!(scratch.is_empty());
+    assert!(scratch.capacity() <= policy.max_bytes);
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch.get(0).unwrap().payload, Some(&b"11"[..]));
+    assert_eq!(
+        producer.outq_len(),
+        0,
+        "no prefix may enter the native queue"
+    );
+    producer.flush(1000)?;
+    assert_eq!(deliveries.get(), 0, "no native delivery was scheduled");
+    Ok(())
+}

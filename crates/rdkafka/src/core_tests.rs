@@ -36,6 +36,9 @@ fn core() -> Rc<Core> {
         active: Rc::clone(&callbacks.borrow().active),
         callbacks: Rc::clone(&callbacks),
         rebalance_snapshot: RefCell::default(),
+        pending_error: RefCell::default(),
+        partition_counts: RefCell::default(),
+        pending_events: RefCell::default(),
     })
 }
 
@@ -155,4 +158,149 @@ fn unit_scenario_callback_query_reuses_drive_without_dispatching() {
     assert!(core.active.get());
     drop(guard);
     assert!(!core.active.get());
+}
+
+#[test]
+fn unit_scenario_received_record_defers_callback_failure_without_loss() {
+    let core = core();
+    for error in [
+        Error::Tls("bad certificate".into()),
+        Error::Config("oauth refresh".into()),
+    ] {
+        let fetched = core
+            .finish_received(Ok(Some(42)), Err(error), Option::is_some)
+            .unwrap();
+        assert_eq!(fetched, Some(42));
+        assert!(core.take_pending_error().is_err());
+        assert!(core.take_pending_error().is_ok());
+    }
+    let empty = core.finish_received(
+        Ok(None::<i32>),
+        Err(Error::Tls("offline".into())),
+        Option::is_some,
+    );
+    assert!(matches!(empty, Err(Error::Tls(_))));
+}
+
+#[test]
+fn unit_scenario_callback_slots_restore_after_unwind_and_resume_queued_events() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    for kind in [0, 1, 5, 6, 7, 8, 9, 10] {
+        let core = core();
+        {
+            let mut callbacks = core.callbacks.borrow_mut();
+            callbacks.delivery = Some(Box::new(|_| panic!("delivery")));
+            callbacks.event = Some(Box::new(|_| panic!("event")));
+            callbacks.rebalance = Some(Box::new(|_, _| panic!("rebalance")));
+            callbacks.commit = Some(Box::new(|_, _| panic!("commit")));
+            callbacks.oauth = Some(Box::new(|_| panic!("oauth")));
+            callbacks.socket = Some(Box::new(|_, _, _| panic!("socket")));
+            callbacks.open = Some(Box::new(|_, _, _| panic!("open")));
+            callbacks.consume = Some(Box::new(|_| panic!("consume")));
+        }
+        assert!(
+            catch_unwind(AssertUnwindSafe(
+                || core.dispatch(vec![event(kind, ""), event(0, "")])
+            ))
+            .is_err()
+        );
+        let state = core.callbacks.borrow();
+        assert!(state.delivery.is_some() && state.event.is_some() && state.rebalance.is_some());
+        assert!(state.commit.is_some() && state.oauth.is_some() && state.consume.is_some());
+        assert!(state.socket.is_some() && state.open.is_some());
+        drop(state);
+        assert!(core.rebalance_snapshot.borrow().is_none());
+        let delivered = Rc::new(Cell::new(0));
+        let seen = Rc::clone(&delivered);
+        core.callbacks.borrow_mut().delivery = Some(Box::new(move |_| seen.set(seen.get() + 1)));
+        core.dispatch(Vec::new()).unwrap();
+        assert_eq!(delivered.get(), 1);
+    }
+}
+
+#[test]
+fn unit_scenario_partitioner_slots_restore_after_unwind() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let callbacks = RefCell::new(Callbacks::default());
+    callbacks.borrow_mut().partitioner = Some(Box::new(|_, _, _| panic!("partitioner")));
+    callbacks.borrow_mut().key_partitioner = Some(Box::new(|_, _, _| panic!("key partitioner")));
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            with_callback(
+                &callbacks,
+                |c| &mut c.partitioner,
+                |cb| cb("orders", None, 3),
+            )
+        }))
+        .is_err()
+    );
+    assert!(callbacks.borrow().partitioner.is_some());
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            with_callback(
+                &callbacks,
+                |c| &mut c.key_partitioner,
+                |cb| cb("orders", None, 3),
+            )
+        }))
+        .is_err()
+    );
+    assert!(callbacks.borrow().key_partitioner.is_some());
+}
+
+#[test]
+fn unit_scenario_nonempty_receive_batch_retains_every_record_before_deferred_error() {
+    let core = core();
+    for error in [
+        Error::Tls("bad certificate".into()),
+        Error::Config("oauth refresh".into()),
+    ] {
+        let delivered = core
+            .finish_received(Ok(vec![7, 11, 13]), Err(error), |batch| !batch.is_empty())
+            .unwrap();
+        assert_eq!(delivered, [7, 11, 13]);
+        assert!(core.take_pending_error().is_err());
+        assert!(core.take_pending_error().is_ok());
+    }
+    let empty = core.finish_received(
+        Ok(Vec::<i32>::new()),
+        Err(Error::Config("oauth refresh".into())),
+        |batch| !batch.is_empty(),
+    );
+    assert!(matches!(empty, Err(Error::Config(message)) if message == "oauth refresh"));
+}
+
+#[test]
+fn unit_scenario_fetched_message_survives_oauth_and_tls_dispatch_failures() {
+    let core = core();
+    core.callbacks.borrow_mut().oauth =
+        Some(Box::new(|_| Err(Error::Config("refresh failed".into()))));
+    for kind in [7, 13] {
+        let message = Message {
+            topic: "orders".into(),
+            partition: 2,
+            offset: 42,
+            timestamp: Some(123),
+            key: Some(b"key".to_vec()),
+            payload: Some(b"unique-record".to_vec()),
+            headers: Headers::new(),
+            token: 0,
+        };
+        let callbacks = core.dispatch(vec![event(kind, "certificate rejected")]);
+        let fetched = core
+            .finish_received(Ok(Some(message)), callbacks, Option::is_some)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.offset, 42);
+        assert_eq!(fetched.payload.as_deref(), Some(&b"unique-record"[..]));
+        let deferred = core.poll(0);
+        if kind == 7 {
+            assert!(matches!(deferred, Err(Error::Config(message)) if message == "refresh failed"));
+        } else {
+            assert!(
+                matches!(deferred, Err(Error::Tls(message)) if message == "certificate rejected")
+            );
+        }
+        assert!(!core.active.get());
+    }
 }

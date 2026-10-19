@@ -87,3 +87,90 @@ fn integration_scenario_native_error_lookup_preserves_unknown_identity() {
         assert_eq!(ffi::error_flags(code), 0);
     }
 }
+
+#[test]
+fn integration_scenario_critical_callbacks_are_lossless_and_fds_are_cloexec() {
+    assert!(ffi::native_callback_contract_test());
+}
+
+#[test]
+fn integration_lifecycle_unforward_releases_destination_owner() {
+    let mut producer = mock_producer();
+    let mut other = mock_producer();
+    let mut source = ffi::queue_new(producer.pin_mut(), "", -1).expect("source");
+    let destination = ffi::queue_new(other.pin_mut(), "", -1).expect("destination");
+    ffi::queue_forward(source.pin_mut(), &destination);
+    assert!(ffi::queue_retains_forwarded_owner(&source));
+    drop(destination);
+    drop(other);
+    ffi::queue_unforward(source.pin_mut());
+    assert!(!ffi::queue_retains_forwarded_owner(&source));
+}
+
+#[test]
+fn integration_scenario_native_murmur2_and_large_flush_preserve_all_deliveries() {
+    let mut conf = ffi::conf_new(false);
+    ffi::conf_set(conf.pin_mut(), "test.mock.num.brokers", "1").expect("mock");
+    ffi::conf_set(conf.pin_mut(), "partitioner", "murmur2_random").expect("partitioner");
+    ffi::conf_set(conf.pin_mut(), "log_level", "0").expect("quiet");
+    let mut producer = ffi::client_new(&conf, 0).expect("producer");
+    let mut topic_conf = ffi::conf_new(true);
+    ffi::conf_set(topic_conf.pin_mut(), "partitioner", "murmur2_random")
+        .expect("topic partitioner");
+    let topic = ffi::topic_new(producer.pin_mut(), "large-flush", &topic_conf).expect("topic");
+    let metadata =
+        ffi::client_metadata(producer.pin_mut(), "large-flush", 5000).expect("discover mock topic");
+    let count = metadata
+        .topics
+        .iter()
+        .find(|topic| topic.name == "large-flush")
+        .expect("requested topic")
+        .partitions;
+    assert!(count > 0);
+    let total = 5000u64;
+    let mut expected = Vec::new();
+    for token in 0..total {
+        let key = token.to_le_bytes();
+        expected.push(ffi::topic_murmur2_partition(&topic, &key, count));
+        let code = if token % 2 == 0 {
+            ffi::produce(
+                producer.pin_mut(),
+                "large-flush",
+                -1,
+                &key,
+                true,
+                b"value",
+                true,
+                &[],
+                -1,
+                token,
+            )
+        } else {
+            ffi::produce_topic(
+                producer.pin_mut(),
+                &topic,
+                -1,
+                &key,
+                true,
+                b"value",
+                true,
+                &[],
+                -1,
+                token,
+            )
+        };
+        assert_eq!(code, 0);
+    }
+    assert_eq!(ffi::client_flush(producer.pin_mut(), 10000), 0);
+    let mut seen = vec![false; total as usize];
+    for event in ffi::client_poll(producer.pin_mut(), 0) {
+        if event.kind == 0 {
+            assert_eq!(event.code, 0);
+            let token = event.token as usize;
+            assert!(!seen[token]);
+            seen[token] = true;
+            assert_eq!(event.partition, expected[token]);
+        }
+    }
+    assert!(seen.iter().all(|seen| *seen));
+}

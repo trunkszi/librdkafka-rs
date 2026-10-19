@@ -29,6 +29,7 @@ public:
   ~Callbacks();
   rust::Box<NativeHooks> hooks;
   bool manual_rebalance = false;
+  bool has_partitioner = false;
   std::unique_ptr<EventQueue> events;
   rust::Vec<NativeEvent> drain();
   void record(int kind, int code, std::string text, std::string topic = "",
@@ -91,6 +92,9 @@ int32_t partitioner_pointer(const rd_kafka_topic_t *, const void *, size_t,
                             int32_t, void *, void *);
 int32_t partitioner_string(const rd_kafka_topic_t *, const void *, size_t,
                            int32_t, void *, void *);
+bool native_callback_contract_test();
+bool queue_retains_forwarded_owner(const Queue &);
+int32_t topic_murmur2_partition(const Topic &, rust::Slice<const uint8_t>, int32_t);
 std::unique_ptr<Conf> conf_new(bool);
 void conf_set_hooks(Conf &, rust::Box<NativeHooks>);
 void conf_set_observers(Conf &, bool, bool);
@@ -102,6 +106,7 @@ void conf_set(Conf &, rust::Str, rust::Str);
 rust::String conf_get(const Conf &, rust::Str);
 rust::Vec<NativeProperty> conf_dump(const Conf &);
 std::unique_ptr<Client> client_new(const Conf &, int32_t);
+std::unique_ptr<Client> client_new_with_partitioner(const Conf &, int32_t, bool);
 rust::Vec<NativeEvent> client_poll(Client &, int32_t);
 int32_t client_flush(Client &, int32_t);
 int32_t client_outq(const Client &);

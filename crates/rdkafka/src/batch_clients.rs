@@ -237,6 +237,8 @@ impl ReceivedBatch {
         Ok(Some(record))
     }
     /// Iterates native records without copying payloads.
+    /// # Errors
+    /// Each item returns the native message error for an error record.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = Result<WireRecord<'_>>> {
         self.entries.iter().enumerate().map(|(index, _)| {
             self.get(index)?
@@ -350,10 +352,13 @@ impl Consumer {
             ));
         }
         let _guard = self.core.begin_drive()?;
+        self.core.take_pending_error()?;
         let outcome =
             native::consume_records(self.core.native.borrow_mut().pin_mut(), maximum, timeout_ms)
                 .map_err(Error::from);
-        let mut received = self.core.complete(outcome)?;
+        let mut received = self
+            .core
+            .complete_received(outcome, |batch| native::batch_count(batch) != 0)?;
         let mut entries = Vec::with_capacity(native::batch_count(&received));
         for index in 0..native::batch_count(&received) {
             let message = native::batch_take(received.pin_mut(), index);

@@ -96,7 +96,13 @@ void queue_forward(Queue &q, const Queue &d) {
   rd_kafka_queue_forward(q.value, d.value);
   q.forwarded_owner = d.owner;
 }
-void queue_unforward(Queue &q) { rd_kafka_queue_forward(q.value, nullptr); }
+bool queue_retains_forwarded_owner(const Queue &q) {
+  return static_cast<bool>(q.forwarded_owner);
+}
+void queue_unforward(Queue &q) {
+  rd_kafka_queue_forward(q.value, nullptr);
+  q.forwarded_owner.reset();
+}
 int32_t queue_poll(Queue &q, int32_t timeout) {
   return rd_kafka_queue_poll_callback(q.value, timeout);
 }
