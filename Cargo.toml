@@ -67,3 +67,23 @@ manual_string_new = "deny"
 let_underscore_must_use = "deny"
 todo = "deny"
 unimplemented = "deny"
+
+# Dev profile: disable full DWARF debuginfo and incremental compilation (for sccache)
+[profile.dev]
+opt-level = 0
+debug = false
+strip = "debuginfo"
+incremental = false
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.dev.build-override]
+debug = false
+
+[profile.test]
+inherits = "dev"
+opt-level = 0
+debug = false
+strip = "debuginfo"
+incremental = false
