@@ -5,6 +5,30 @@ A synchronous Kafka client SDK with thread-affine Rust handles and a statically 
 and metadata stay on their creating thread. Delivery and local observer callbacks run when the
 caller drives the client.
 
+## Workspace
+
+| Crate | Responsibility |
+| --- | --- |
+| `rdkafka` | Public synchronous clients, records, batches, TLS, and optional HTTP services |
+| `rdkafka-macros` | `#[derive(Record)]` record views and SoA batch generation |
+| `rdkafka-sys` | Static CMake native core, `cxx` C++/C bridge, and ring-backed SASL crypto |
+
+## Features
+
+| Feature | Dependencies and behavior |
+| --- | --- |
+| Default (`[]`) | Core Kafka clients, typed records, batches, and OpenSSL-free native SASL |
+| `tls` | Verified broker TLS through `rustls`, `rustls-native-certs`, and `rustls-pemfile` |
+| `http` | Implies `tls`; enables HTTP/2 `curl`, `url`, `serde_json`, and Linux `memfd` identity backing |
+| `tracing` | Payload-size and operation diagnostics without payload contents |
+
+The optional `curl` dependency is pinned by `Cargo.lock` from
+`https://github.com/trunkszi/curl-rust.git`, branch `feat/event-loop-ws`, with
+`http2`. HTTP transport verifies that the linked curl runtime uses rustls.
+Neither OpenSSL crates nor async runtimes are used.
+
+## Core synchronous clients
+
 ```rust,no_run
 use rdkafka::{Conf, ProduceRecord, Producer};
 
@@ -18,16 +42,18 @@ fn main() -> rdkafka::Result<()> {
 }
 ```
 
-## Native build
+## Build and native source resolution
 
 The build needs Git, CMake, a C/C++17 toolchain, and the Rust toolchain declared in
-`rust-toolchain.toml`. It builds static Kafka, zlib, and zstd archives; lz4, snappy, and crc32c use
+`rust-toolchain.toml`. The Kafka configuration sets `RDKAFKA_BUILD_STATIC=ON`, `WITH_SSL=OFF`, and
+`WITH_CURL=OFF`. It builds static Kafka, zlib, and zstd archives; lz4, snappy, and crc32c use
 Kafka's bundled implementations. The native Kafka build excludes OpenSSL and native curl;
 optional HTTP services use the separate rustls-backed curl transport. Asynchronous Rust runtimes
 are absent.
 
-Kafka source resolution checks `LIBRDKAFKA_DIR`, then `vendor/librdkafka`, then a verified source
-checkout in `target/vendor-cache/librdkafka`. Automatic downloads use pinned revisions. A source
+Kafka source resolution checks `LIBRDKAFKA_DIR`, then `../../vendor/librdkafka` relative to
+`crates/rdkafka-sys` (the workspace `vendor/librdkafka`), then a verified source
+checkout in `target/vendor-cache/librdkafka` under the workspace or configured target directory. Automatic downloads use pinned revisions. A source
 override must contain `src-cpp/rdkafkacpp.h`.
 
 The native core supports plaintext, SASL/PLAIN, SCRAM-SHA-256/512, and OAuth bearer
@@ -74,26 +100,6 @@ drained during caller polling. Observer queue overflow returns a named error.
 Consumed owned messages preserve null and empty keys, payloads, and duplicate header names.
 Native-backed receive methods additionally expose borrowed payload/key slices while retaining
 native storage and its client owner. Topic and queue children retain their parent resources.
-
-## Validation
-
-```sh
-bash .github/scripts/ci-incremental.sh origin/main
-```
-
-The gate checks source size, dependency syntax, resolved dependency bans, formatting, Clippy,
-mock-broker tests, doctests, typed-record codecs and retention, real HTTP/2 TLS/OIDC,
-Schema Registry, and a live Docker Redpanda round trip for all five compression modes.
-Each live test container is scoped to that invocation and removed when it exits.
-
-To reuse an existing plaintext broker:
-
-```sh
-RDKAFKA_TEST_BROKERS=127.0.0.1:9092 bash .github/scripts/test-redpanda.sh
-```
-
-Typed record schemas, reusable Structure-of-Arrays batches, and caller-buffer codecs
-connect directly to the native producer and consumer APIs.
 
 ## Transactions, administration, and batch receive
 
@@ -179,7 +185,12 @@ schema metadata rather than on-wire field names. Both peers must use the same
 field order and schema. Self-describing decoding and conditional field omission
 are unsupported.
 
-`encode_batch_into` reuses caller scratch and appends to a `WireBatch`.
+`Producer::produce_serde_batch`, `produce_batch_using`, and
+`produce_batch_using_with_policy` reuse caller-owned wire and byte scratch buffers.
+`Consumer::consume_serde_with`, `consume_with_using`, `consume_into_using`, and
+`consume_into_slice_using` provide corresponding decode/visitor paths.
+
+`SerdeBridge::encode_batch_into` reuses caller scratch and appends to a `WireBatch`.
 `decode_batch_with` streams callbacks without an intermediate vector;
 `decode_batch_into` appends owned or borrowed values, and
 `decode_batch_into_slice` fills existing slots. A later record failure leaves
@@ -237,6 +248,13 @@ and schema language/definition; latest-version requests reach the registry.
 `encode_confluent` replaces a caller-owned byte buffer with the magic byte,
 big-endian schema ID, and payload; `decode_confluent` borrows the payload.
 
+HTTP tests include real HTTP/2/rustls, mTLS, OIDC, and an isolated Docker Redpanda
+Schema Registry. The live test starts and removes its own container unless
+`RDKAFKA_SCHEMA_REGISTRY_URL` selects an existing test registry. Docker is a CI
+prerequisite; a missing service is a failure, not a passing skipped test.
+
+## Scaling across OS threads
+
 `ThreadLocalClient` and `WorkerClient` are shareable managers when their factory
 is `Send + Sync`. Share a reference or an `Arc` directly across OS threads; each
 thread lazily creates its own `!Send + !Sync` client or slot pool. Clones share
@@ -248,7 +266,25 @@ release their slots on drop. `reset()` releases only the calling thread's pool;
 call it explicitly if clients retain their manager and create an ownership cycle. After the last manager drops, remote caches are reclaimed
 on their next manager access or thread exit. No client state crosses threads.
 
-HTTP tests include real HTTP/2/rustls, mTLS, OIDC, and an isolated Docker Redpanda
-Schema Registry. The live test starts and removes its own container unless
-`RDKAFKA_SCHEMA_REGISTRY_URL` selects an existing test registry. Docker is a CI
-prerequisite; a missing service is a failure, not a passing skipped test.
+## Verification
+
+```sh
+bash .github/scripts/check-source-contracts.sh
+python3 .github/scripts/test-ci-contracts.py
+cargo test -p rdkafka --doc
+cargo test -p rdkafka --features http --doc
+bash .github/scripts/ci-incremental.sh origin/main
+bash .github/scripts/test-redpanda.sh
+bash .github/scripts/test-broker-security.sh
+```
+
+The gate checks source size, dependency syntax, resolved dependency bans, formatting, Clippy,
+mock-broker tests, doctests, typed-record codecs and retention, real HTTP/2 TLS/OIDC,
+Schema Registry, and a live Docker Redpanda round trip for all five compression modes.
+Each live test container is scoped to that invocation and removed when it exits.
+
+To reuse an existing plaintext broker:
+
+```sh
+RDKAFKA_TEST_BROKERS=127.0.0.1:9092 bash .github/scripts/test-redpanda.sh
+```
