@@ -42,7 +42,7 @@ static int tls_connect(int fd, const sockaddr *address, int size,
                        const char *name, void *) {
   auto *callbacks = find_callbacks(fd, false);
   if (!callbacks) return EINVAL;
-  char host[NI_MAXHOST], service[NI_MAXSERV];
+  char host[NI_MAXHOST] = {}, service[NI_MAXSERV] = {};
   if (getnameinfo(address, static_cast<socklen_t>(size), host, sizeof(host),
                   service, sizeof(service), NI_NUMERICHOST | NI_NUMERICSERV))
     return EINVAL;

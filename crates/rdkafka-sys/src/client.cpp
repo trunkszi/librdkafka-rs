@@ -81,9 +81,9 @@ int32_t client_controller(Client &c, int32_t timeout) {
   return rd_kafka_controllerid(c.raw(), timeout);
 }
 NativeEvent client_fatal(Client &c) {
-  char text[512];
+  char text[512] = {};
   auto e = rd_kafka_fatal_error(c.raw(), text, sizeof(text));
-  return {1, e, rust::String(text), "", -1, -1, 0, {}};
+  return {1, e, e ? rust::String(text) : rust::String(), "", -1, -1, 0, {}};
 }
 NativeMetadata client_metadata(Client &c, rust::Str topic, int32_t timeout) {
   const rd_kafka_metadata_t *md = nullptr;

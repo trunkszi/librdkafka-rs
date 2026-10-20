@@ -529,7 +529,7 @@ void oauth_set_token(Client &c, rust::Str token, int64_t expiry,
   std::vector<const char *> ext;
   for (const auto &e : owned)
     ext.push_back(e.c_str());
-  char error[512];
+  char error[512] = {};
   auto code = rd_kafka_oauthbearer_set_token(c.raw(), t.c_str(), expiry,
                                              p.c_str(), ext.data(), ext.size(),
                                              error, sizeof(error));
