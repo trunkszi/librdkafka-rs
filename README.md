@@ -266,6 +266,21 @@ release their slots on drop. `reset()` releases only the calling thread's pool;
 call it explicitly if clients retain their manager and create an ownership cycle. After the last manager drops, remote caches are reclaimed
 on their next manager access or thread exit. No client state crosses threads.
 
+## Examples
+
+Runnable examples in `crates/rdkafka/examples/` default to the in-process native
+mock broker (`test.mock.num.brokers`) and switch to a live Kafka/Redpanda
+cluster when `RDKAFKA_BROKERS` is set:
+
+| Example | Command | Coverage |
+| --- | --- | --- |
+| `01_basic_produce_consume` | `cargo run -p rdkafka --example 01_basic_produce_consume` | `Conf`, caller-thread `delivery_report_cb`, `Headers`, `Producer::produce`, `Consumer::consume_native` |
+| `02_derive_record_soa_batch` | `cargo run -p rdkafka --example 02_derive_record_soa_batch` | `#[derive(Record)]`, SoA `<Name>Batch`, `zerocopy` projection, `BufferPolicy`, `produce_batch`, `consume_batch`, `ReceivedBatch::visit_from` |
+| `03_serde_bridge_scratch` | `cargo run -p rdkafka --example 03_serde_bridge_scratch` | `SerdeBridge`, borrowed zero-copy decode, `DecodeLimits`, `produce_batch_using_with_policy`, `consume_serde_with` |
+| `04_admin_rebalance_transactions` | `cargo run -p rdkafka --example 04_admin_rebalance_transactions` | Transactional producer commit/abort/purge, `incremental_assign`/`incremental_unassign`, `AdminClient` |
+| `05_multithread_workers` | `cargo run -p rdkafka --example 05_multithread_workers` | `ThreadLocalProducer`, `WorkerProducer`, `WorkerBalance::KeyHash`, `WorkerSlotLease` across OS threads |
+| `06_tls_http_schema_oauth` | `cargo run -p rdkafka --features http --example 06_tls_http_schema_oauth` | `TlsSettings`, `HttpTransport`, Confluent wire framing, `SchemaRegistryClient`, `OAuthBearerHttpClient` |
+
 ## Verification
 
 ```sh

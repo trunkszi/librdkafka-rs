@@ -39,3 +39,7 @@ static_assertions = { workspace = true }
 
 [lints]
 workspace = true
+
+[[example]]
+name = "06_tls_http_schema_oauth"
+required-features = ["http"]
