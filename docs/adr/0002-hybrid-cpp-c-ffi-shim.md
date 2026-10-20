@@ -1,3 +1,0 @@
-# Complete `rdkafkacpp.h` Coverage with `.c_ptr()` Batch Extensions
-
-`rdkafka-sys` wraps the entire public surface of `librdkafka`'s C++ SDK (`rdkafkacpp.h`, namespace `RdKafka`) via `cxx::bridge`, preserving its object model (`Conf`, `Handle`, `Producer`, `Consumer`, `KafkaConsumer`, `Topic`, `TopicPartition`, `Message`, `Headers`, `Queue`, `Metadata`, `Event`, and all callback interfaces), while using `RdKafka::Handle::c_ptr()` and `RdKafka::Conf::c_ptr()` inside the C++ shim to expose vectorized batch operations (`rd_kafka_produceva`, `rd_kafka_consume_batch_queue`), Admin operations, and `rustls` socket callbacks.
