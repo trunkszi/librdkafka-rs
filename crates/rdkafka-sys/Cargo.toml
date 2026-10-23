@@ -1,0 +1,26 @@
+[package]
+name = "librdkafka-rs-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+description = "Bundled librdkafka C/C++ bridge for the librdkafka-rs workspace"
+links = "rdkafka"
+build = "build.rs"
+
+[lib]
+name = "rdkafka_sys"
+
+[dependencies]
+cxx = { workspace = true }
+ring = { workspace = true }
+base64 = { workspace = true }
+libc = { workspace = true }
+
+[build-dependencies]
+cxx-build = { workspace = true }
+cmake = { workspace = true }
+
+[lints]
+workspace = true

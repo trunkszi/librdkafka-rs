@@ -1,0 +1,86 @@
+[workspace]
+members = ["crates/rdkafka-sys", "crates/rdkafka-macros", "crates/rdkafka"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "BSD-2-Clause"
+repository = "https://github.com/trunkszi/librdkafka-rs"
+
+[workspace.dependencies]
+rdkafka-sys = { version = "0.0.1", path = "crates/rdkafka-sys", package = "librdkafka-rs-sys" }
+rdkafka-macros = { version = "0.0.1", path = "crates/rdkafka-macros" }
+cxx = { version = "1.0" }
+cxx-build = { version = "1.0" }
+cmake = { version = "0.1" }
+thiserror = { version = "2.0" }
+anyhow = { version = "1.0" }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+libc = { version = "0.2" }
+static_assertions = { version = "1.1" }
+
+serde = { version = "1", features = ["derive"] }
+serde_bytes = { version = "0.11" }
+zerocopy = { version = "0.8", features = ["derive"] }
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = { version = "1" }
+proc-macro2 = { version = "1" }
+darling = { version = "0.23" }
+heck = { version = "0.5" }
+convert_case = { version = "0.11" }
+synstructure = { version = "0.13" }
+proc-macro-crate = { version = "3" }
+
+nexora = { version = "0.0.1" }
+sonic-rs = { version = "0.5.10" }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-native-certs = { version = "0.8" }
+rustls-pemfile = { version = "2" }
+rcgen = { version = "0.13" }
+ring = { version = "0.17" }
+base64 = { version = "0.22" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+clone_on_copy = "deny"
+redundant_clone = "deny"
+implicit_clone = "deny"
+unnecessary_to_owned = "deny"
+cloned_instead_of_copied = "deny"
+inefficient_to_string = "deny"
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
+expl_impl_clone_on_copy = "deny"
+non_canonical_clone_impl = "deny"
+useless_conversion = "deny"
+useless_asref = "deny"
+to_string_in_format_args = "deny"
+manual_string_new = "deny"
+let_underscore_must_use = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+# Dev profile: disable full DWARF debuginfo and incremental compilation (for sccache)
+[profile.dev]
+opt-level = 0
+debug = false
+strip = "debuginfo"
+incremental = false
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.dev.build-override]
+debug = false
+
+[profile.test]
+inherits = "dev"
+opt-level = 0
+debug = false
+strip = "debuginfo"
+incremental = false
