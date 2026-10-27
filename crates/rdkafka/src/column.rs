@@ -158,22 +158,28 @@ impl<T: Clone + ColumnValue> ReusableColumn<T> {
         }
     }
     /// Number of visible values.
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
     /// Whether the column has no visible values.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
     /// Borrow only the visible contiguous values.
+    #[inline]
     pub fn as_slice(&self) -> &[T] {
-        &self.values[..self.len]
+        // SAFETY: only initialized slots become visible. Appends advance len after success;
+        // truncate/clear only decrease it, including when a user clone or cleanup panics.
+        unsafe { self.values.get_unchecked(..self.len) }
     }
     /// Reduce the visible length, retaining initialized slots and their allocations.
     ///
     /// A length at least as large as the current length has no effect. Hidden
     /// values are reused by subsequent appends; truncation never drops values
     /// or invokes their cloning or cleanup methods.
+    #[inline]
     pub fn truncate(&mut self, len: usize) {
         self.len = self.len.min(len);
     }
@@ -181,6 +187,7 @@ impl<T: Clone + ColumnValue> ReusableColumn<T> {
     /// # Panics
     /// Panics if field creation, cloning, or updating panics, or vector growth exceeds its size
     /// limit.
+    #[inline]
     pub fn push_with(&mut self, create: impl FnOnce() -> T, update: impl FnOnce(&mut T)) {
         if let Some(slot) = self.values.get_mut(self.len) {
             update(slot);
@@ -197,6 +204,7 @@ impl<T: Clone + ColumnValue> ReusableColumn<T> {
     /// # Panics
     /// Panics if field creation, cloning, or updating panics, or vector growth exceeds its size
     /// limit.
+    #[inline]
     pub fn push_owned(&mut self, value: T) {
         if let Some(slot) = self.values.get_mut(self.len) {
             slot.clone_from(&value);
@@ -209,6 +217,7 @@ impl<T: Clone + ColumnValue> ReusableColumn<T> {
     /// # Panics
     /// Panics if field creation, cloning, or updating panics, or vector growth exceeds its size
     /// limit.
+    #[inline]
     pub fn push(&mut self, value: &T) {
         if let Some(slot) = self.values.get_mut(self.len) {
             slot.clone_from(value);

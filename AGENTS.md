@@ -81,7 +81,7 @@ Keep endpoint credentials, fragments, response bodies, and secrets out of errors
 
 ## Hard Invariants & Coding Standards
 
-- **No Async Runtimes or OpenSSL**: `tokio`, `futures`, `futures-core`, `futures-util`, `async-std`, `smol`, `openssl`, `openssl-sys`, `curl`, `curl-sys`, `memfd`, `url`, and `serde_json` are strictly forbidden across all manifests and `Cargo.lock`.
+- **No Async Runtimes or OpenSSL**: `tokio`, `futures`, `futures-core`, `futures-util`, `async-std`, `smol`, `openssl`, `openssl-sys`, `curl`, `curl-sys`, `memfd`, and `url` are strictly forbidden across all manifests and `Cargo.lock`. `serde_json` is forbidden in all manifests and production dependencies; dev-only transitive `Cargo.lock` entries required by Criterion are permitted.
 - **Owned Source Boundaries**: Scan `.rs`, `.c`, `.cpp`, `.cc`, `.h`, and `.hpp` in source directories and native shims for removed backend includes, types, and API identifiers. Preserve the native build setting `WITH_CURL=OFF`.
 - **File Size Limit**: Repository text files must stay at or below **800 lines** and use ASCII English. Automatically generated `Cargo.lock` is exempt from the line limit; preserve Cargo native formatting and never compact it.
 - **Manifest Syntax**: Every dependency declaration in every `Cargo.toml` must use direct single-line inline-table syntax (`pkg = { ... }`). Dependency subtables and dotted keys are forbidden.

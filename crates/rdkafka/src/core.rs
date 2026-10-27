@@ -7,10 +7,27 @@ use std::{
 use rdkafka_sys::ffi;
 
 use crate::{callbacks::*, *};
+/// Drive ownership is shared by clients using the same callback registry.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DriveState {
+    #[default]
+    Idle = 0,
+    DrivingPoll = 0x10,
+    DrivingCallback = 0x11,
+    Closing = 0x20,
+}
+impl DriveState {
+    fn is_driving(self) -> bool {
+        self as u8 & 0xf0 == 0x10
+    }
+}
+const _: () = assert!(size_of::<DriveState>() == 1);
+
 pub(crate) struct Core {
     pub native: RefCell<cxx::UniquePtr<ffi::Client>>,
     pub callbacks: Rc<RefCell<Callbacks>>,
-    active: Rc<Cell<bool>>,
+    drive: Rc<Cell<DriveState>>,
     pub partition_counts: RefCell<std::collections::HashMap<String, i32>>,
     pub pending_error: RefCell<Option<Error>>,
     pending_tls_error: RefCell<Option<Error>>,
@@ -18,11 +35,12 @@ pub(crate) struct Core {
     pub rebalance_snapshot: RefCell<Option<(bool, String)>>,
 }
 pub(crate) struct DriveGuard {
-    active: Rc<Cell<bool>>,
+    state: Rc<Cell<DriveState>>,
+    restore: DriveState,
 }
 impl Drop for DriveGuard {
     fn drop(&mut self) {
-        self.active.set(false);
+        self.state.set(self.restore);
     }
 }
 pub(crate) fn status(code: i32) -> Result<()> {
@@ -91,7 +109,7 @@ impl Core {
                 state.partitioner.is_some() || state.key_partitioner.is_some()
             })?),
             callbacks: Rc::clone(&conf.callbacks),
-            active: Rc::clone(&conf.callbacks.borrow().active),
+            drive: Rc::clone(&conf.callbacks.borrow().drive),
             rebalance_snapshot: RefCell::default(),
             pending_error: RefCell::default(),
             pending_tls_error: RefCell::default(),
@@ -100,13 +118,21 @@ impl Core {
         }))
     }
     pub fn begin_drive(&self) -> Result<DriveGuard> {
-        if self.active.get() {
+        if self.drive.get() != DriveState::Idle {
             return Err(Error::ReentrantDrive);
         }
-        self.active.set(true);
+        self.drive.set(DriveState::DrivingPoll);
         Ok(DriveGuard {
-            active: Rc::clone(&self.active),
+            state: Rc::clone(&self.drive),
+            restore: DriveState::Idle,
         })
+    }
+    fn callback_scope(&self) -> DriveGuard {
+        let previous = self.drive.replace(DriveState::DrivingCallback);
+        DriveGuard {
+            state: Rc::clone(&self.drive),
+            restore: previous,
+        }
     }
     pub fn poll(&self, timeout: i32) -> Result<usize> {
         let _guard = self.begin_drive()?;
@@ -138,10 +164,13 @@ impl Core {
     }
     /// Queries from callbacks reuse the active drive without recursive dispatch.
     pub fn query<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
-        let guard = if self.active.get() {
+        let phase = self.drive.get();
+        let guard = if phase == DriveState::Idle {
+            Some(self.begin_drive()?)
+        } else if phase.is_driving() {
             None
         } else {
-            Some(self.begin_drive()?)
+            return Err(Error::ReentrantDrive);
         };
         let outcome = operation();
         if guard.is_some() {
@@ -225,6 +254,20 @@ impl Core {
     }
 }
 
+impl Drop for Core {
+    fn drop(&mut self) {
+        let _scope = DriveGuard {
+            state: Rc::clone(&self.drive),
+            restore: self.drive.replace(DriveState::Closing),
+        };
+        // Destroy under the closing guard without leaving sibling clients permanently blocked.
+        drop(std::mem::replace(
+            self.native.get_mut(),
+            cxx::UniquePtr::null(),
+        ));
+    }
+}
+
 pub(crate) fn text(value: &str) -> Result<()> {
     if value.contains('\0') {
         Err(Error::Config("native text contains an embedded NUL".into()))
@@ -245,14 +288,17 @@ mod tests {
     use super::*;
     #[test]
     fn unit_scenario_dispatch_guard_resets_during_unwind() {
-        let active = Rc::new(Cell::new(true));
+        let active = Rc::new(Cell::new(DriveState::DrivingPoll));
         let flag = Rc::clone(&active);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let _guard = DriveGuard { active: flag };
+            let _guard = DriveGuard {
+                state: flag,
+                restore: DriveState::Idle,
+            };
             panic!("user callback panic");
         }));
         assert!(result.is_err());
-        assert!(!active.get());
+        assert_eq!(active.get(), DriveState::Idle);
     }
 
     #[test]
@@ -267,5 +313,21 @@ mod tests {
             i32::MAX
         );
         assert!(timeout(Duration::from_millis(i32::MAX as u64) + Duration::from_nanos(1)).is_err());
+    }
+    #[test]
+    fn shared_callbacks_preserve_native_transactions() -> Result<()> {
+        let mut conf = Conf::new();
+        conf.set("test.mock.num.brokers", "1")?
+            .set("transactional.id", "native-ownership")?;
+        let first = Producer::new(&conf)?;
+        let second = Producer::new(&conf)?;
+        first.init_transactions(10000)?;
+        first.begin_transaction()?;
+        assert!(second.begin_transaction().is_err());
+        let guard = first.core.begin_drive()?;
+        assert!(matches!(second.poll(0), Err(Error::ReentrantDrive)));
+        drop(guard);
+        first.abort_transaction(10000)?;
+        Ok(())
     }
 }

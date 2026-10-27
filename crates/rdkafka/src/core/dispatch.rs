@@ -23,6 +23,10 @@ impl Core {
         }
         self.pending_events.borrow_mut().extend(events);
         let n = self.pending_events.borrow().len();
+        if n == 0 {
+            return self.take_pending_error().map(|()| 0);
+        }
+        let _callback_scope = self.callback_scope();
         loop {
             let Some(e) = self.pending_events.borrow_mut().pop_front() else {
                 break;
@@ -132,6 +136,7 @@ impl Core {
         }
     }
     pub fn observe(&self, m: &Message) {
+        let _callback_scope = self.callback_scope();
         with_callback(&self.callbacks, |state| &mut state.consume, |cb| cb(m));
     }
 }
@@ -173,7 +178,7 @@ mod tests {
         let callbacks = Rc::new(RefCell::new(Callbacks::default()));
         Rc::new(Core {
             native: RefCell::new(cxx::UniquePtr::null()),
-            active: Rc::clone(&callbacks.borrow().active),
+            drive: Rc::clone(&callbacks.borrow().drive),
             callbacks: Rc::clone(&callbacks),
             rebalance_snapshot: RefCell::default(),
             pending_error: RefCell::default(),
@@ -304,14 +309,14 @@ mod tests {
         let guard = core.begin_drive().unwrap();
         // The native handle is absent: dispatching here would dereference it.
         let result = core.query(|| {
-            assert!(core.active.get());
+            assert!(core.drive.get().is_driving());
             assert!(matches!(core.begin_drive(), Err(Error::ReentrantDrive)));
             Err::<(), _>(Error::Config("query failed".into()))
         });
         assert!(matches!(result, Err(Error::Config(message)) if message == "query failed"));
-        assert!(core.active.get());
+        assert!(core.drive.get().is_driving());
         drop(guard);
-        assert!(!core.active.get());
+        assert_eq!(core.drive.get(), DriveState::Idle);
     }
 
     #[test]
@@ -428,7 +433,7 @@ mod tests {
                     matches!(deferred, Err(Error::Tls(message)) if message == "certificate rejected")
                 );
             }
-            assert!(!core.active.get());
+            assert_eq!(core.drive.get(), DriveState::Idle);
         }
     }
 
@@ -562,7 +567,7 @@ mod tests {
         assert!(
             matches!(core.poll(0), Err(Error::Tls(message)) if message == "certificate rejected")
         );
-        assert!(!core.active.get());
+        assert_eq!(core.drive.get(), DriveState::Idle);
         let delivered = Rc::new(Cell::new(0));
         let seen = Rc::clone(&delivered);
         core.callbacks.borrow_mut().delivery = Some(Box::new(move |_| seen.set(seen.get() + 1)));
@@ -670,5 +675,24 @@ mod tests {
         );
         core.take_pending_error()?;
         Ok(())
+    }
+    #[test]
+    fn callback_phase_restores_after_panic() {
+        let core = core();
+        let weak = Rc::downgrade(&core);
+        core.callbacks.borrow_mut().event = Some(Box::new(move |_| {
+            let owner = weak.upgrade().unwrap();
+            assert_eq!(owner.drive.get(), DriveState::DrivingCallback);
+            assert!(matches!(owner.begin_drive(), Err(Error::ReentrantDrive)));
+            panic!("callback unwind");
+        }));
+        let guard = core.begin_drive().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            core.dispatch(vec![event(1, "one")]).unwrap();
+        }));
+        assert!(result.is_err());
+        assert_eq!(core.drive.get(), DriveState::DrivingPoll);
+        drop(guard);
+        assert_eq!(core.drive.get(), DriveState::Idle);
     }
 }
