@@ -8,6 +8,7 @@ readme = "../../README.md"
 description = "Procedural macros for typed Kafka records and zero-copy/SoA batching in librdkafka-rs"
 
 [lib]
+bench = false
 proc-macro = true
 
 [dependencies]

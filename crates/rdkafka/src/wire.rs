@@ -56,6 +56,7 @@ impl<'a> WireHeaders<'a> {
         self.len() == 0
     }
     /// Project one header without allocation.
+    #[inline]
     pub fn get(self, index: usize) -> Option<WireHeader<'a>> {
         match self.source {
             HeaderSource::Slice(v) => v.get(index).copied(),
@@ -214,6 +215,7 @@ impl WireBatch {
     /// # Errors
     /// Returns an error on size overflow or allocation failure. Existing records
     /// remain valid and no partial record is appended.
+    #[inline]
     pub fn push(&mut self, record: WireRecord<'_>) -> Result<()> {
         let mut header_bytes = 0usize;
         for header in record.headers.iter() {
@@ -249,6 +251,7 @@ impl WireBatch {
         Ok(())
     }
     /// Borrow one record without allocation.
+    #[inline]
     pub fn get(&self, index: usize) -> Option<WireRecord<'_>> {
         let record = self.records.get(index)?;
         Some(WireRecord {
@@ -287,7 +290,13 @@ impl WireBatch {
     }
     /// Clear without releasing warmed capacity.
     pub fn clear_unbounded(&mut self) {
-        self.clear_with_policy(BufferPolicy::unbounded());
+        // Unbounded retention needs neither capacity accounting nor shrink checks.
+        self.records.clear();
+        self.headers.clear();
+        self.topics.clear();
+        self.keys.clear();
+        self.payloads.clear();
+        self.header_bytes.clear();
     }
     /// Clear lengths and apply one aggregate record and byte retention budget.
     pub fn clear_with_policy(&mut self, policy: BufferPolicy) {
@@ -313,11 +322,13 @@ impl WireBatch {
         self.header_bytes.shrink_to_fit();
     }
 }
+#[inline]
 fn reserve<T>(destination: &mut Vec<T>, additional: usize) -> Result<()> {
     destination
         .try_reserve(additional)
         .map_err(|error| Error::Layout(format!("wire arena reservation failed: {error}")))
 }
+#[inline]
 fn append(destination: &mut Vec<u8>, bytes: &[u8]) -> Range<usize> {
     let start = destination.len();
     destination.extend_from_slice(bytes);

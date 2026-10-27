@@ -9,6 +9,7 @@ description = "Synchronous, thread-affine Rust Kafka producer, consumer, and adm
 
 [lib]
 name = "rdkafka"
+bench = false
 
 [features]
 default = []
@@ -35,6 +36,7 @@ rustls-native-certs = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 rcgen = { workspace = true }
 static_assertions = { workspace = true }
 
@@ -44,3 +46,7 @@ workspace = true
 [[example]]
 name = "06_tls_http_schema_oauth"
 required-features = ["http"]
+
+[[bench]]
+name = "kafka_hotpath_bench"
+harness = false

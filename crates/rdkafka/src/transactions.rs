@@ -5,6 +5,14 @@ use rdkafka_sys::ffi;
 
 use crate::{Consumer, Producer, Result, TopicPartition, core};
 
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum TransactionOperation {
+    Initialize = 0,
+    Begin = 1,
+    Commit = 2,
+    Abort = 3,
+}
 /// Owned consumer generation and member identity for transactional offsets.
 ///
 /// The metadata remains valid after the consumer is dropped, but a transaction
@@ -20,13 +28,13 @@ impl Producer {
     /// Returns timeout, fatal fencing, or native transaction errors. Inspect the
     /// returned error's recovery flags before retrying.
     pub fn init_transactions(&self, timeout_ms: i32) -> Result<()> {
-        self.transaction(0, timeout_ms)
+        self.transaction(TransactionOperation::Initialize, timeout_ms)
     }
     /// Opens a transaction after successful initialization.
     /// # Errors
     /// Returns native transaction state or fatal errors.
     pub fn begin_transaction(&self) -> Result<()> {
-        self.transaction(1, 0)
+        self.transaction(TransactionOperation::Begin, 0)
     }
     /// Adds the next offsets to consume to the current transaction.
     ///
@@ -57,20 +65,20 @@ impl Producer {
     /// Returns native errors with retry, fatal, and abort-required flags, or a
     /// local callback failure after the native operation completes.
     pub fn commit_transaction(&self, timeout_ms: i32) -> Result<()> {
-        self.transaction(2, timeout_ms)
+        self.transaction(TransactionOperation::Commit, timeout_ms)
     }
     /// Purges pending transactional records and aborts the current transaction.
     /// # Errors
     /// Returns native errors with operation-specific recovery flags or callback
     /// failures after the native operation completes.
     pub fn abort_transaction(&self, timeout_ms: i32) -> Result<()> {
-        self.transaction(3, timeout_ms)
+        self.transaction(TransactionOperation::Abort, timeout_ms)
     }
-    fn transaction(&self, operation: i32, timeout_ms: i32) -> Result<()> {
+    fn transaction(&self, operation: TransactionOperation, timeout_ms: i32) -> Result<()> {
         let _guard = self.core.begin_drive()?;
         let result = ffi::transaction(
             self.core.native.borrow_mut().pin_mut(),
-            operation,
+            operation as i32,
             timeout_ms,
         )
         .map_err(crate::Error::from);

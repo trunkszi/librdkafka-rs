@@ -80,7 +80,7 @@ pub type OpenCb = Box<dyn FnMut(&str, i32, i32)>;
 pub type OAuthBearerTokenRefreshCb = Box<dyn FnMut(&str) -> std::result::Result<(), Error>>;
 #[derive(Default)]
 pub(crate) struct Callbacks {
-    pub active: std::rc::Rc<std::cell::Cell<bool>>,
+    pub drive: std::rc::Rc<std::cell::Cell<crate::core::DriveState>>,
     pub delivery: Option<DeliveryReportCb>,
     pub event: Option<EventCb>,
     pub consume: Option<ConsumeCb>,

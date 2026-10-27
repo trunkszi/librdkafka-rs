@@ -72,7 +72,14 @@ impl Scale {
             other
         }
     }
+    #[inline]
     fn target(self, capacity: usize) -> usize {
+        if self.numerator == self.denominator {
+            return capacity;
+        }
+        if self.numerator == 0 {
+            return 0;
+        }
         ((capacity as u128 * self.numerator as u128) / self.denominator as u128) as usize
     }
 }

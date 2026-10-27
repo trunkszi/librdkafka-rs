@@ -9,6 +9,7 @@ license = "BSD-2-Clause"
 repository = "https://github.com/trunkszi/librdkafka-rs"
 
 [workspace.dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 rdkafka-sys = { version = "0.0.1", path = "crates/rdkafka-sys", package = "librdkafka-rs-sys" }
 rdkafka-macros = { version = "0.0.1", path = "crates/rdkafka-macros" }
 cxx = { version = "1.0" }
