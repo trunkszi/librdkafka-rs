@@ -93,8 +93,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "cares"
 version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "337b65e581f0453ad985ab14266bf00e66122f36ab0699c5eb6b0a4bf5289e31"
+source = "git+https://github.com/trunkszi/cares-rs.git?branch=main#390e4b558accc51cc738896c0bd132225022a274"
 dependencies = [
  "bitflags",
  "cares-macros",
@@ -107,8 +106,7 @@ dependencies = [
 [[package]]
 name = "cares-macros"
 version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69d8a283745b9e80e2274a84fb65cd3d9836d713149aee30defe8cd1e3ae59f7"
+source = "git+https://github.com/trunkszi/cares-rs.git?branch=main#390e4b558accc51cc738896c0bd132225022a274"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -118,8 +116,7 @@ dependencies = [
 [[package]]
 name = "cares-sys"
 version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "737fefb3e29ed80b868fdb976b699efffc6272626745992a90f1e25d92429bb5"
+source = "git+https://github.com/trunkszi/cares-rs.git?branch=main#390e4b558accc51cc738896c0bd132225022a274"
 dependencies = [
  "cc",
  "cmake",
@@ -604,9 +601,8 @@ dependencies = [
 
 [[package]]
 name = "liburing-proactor"
-version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d135ca94fe93bd1b997ae72520afdfd6079410b870ce71c499e76099cbb9a28b"
+version = "0.0.2"
+source = "git+https://github.com/trunkszi/liburing-rs.git?branch=main#69e1c5a25e404f37f467333a6578b5034f1d3ee6"
 dependencies = [
  "io-uring",
  "libc",
@@ -651,8 +647,7 @@ dependencies = [
 [[package]]
 name = "nexora"
 version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57372bd985136a43c5b68ae1cca406a17b58bad005c110fab297649113a70767"
+source = "git+https://github.com/trunkszi/nexora-rs.git?branch=main#cbcb5a36d4194de20f6c16faf37d3d006ad12154"
 dependencies = [
  "cares",
  "libc",
@@ -665,8 +660,7 @@ dependencies = [
 [[package]]
 name = "nexora-macros"
 version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98780afefaf14aaf631b061a573981257886b5120687b43de5980dc716fa81fb"
+source = "git+https://github.com/trunkszi/nexora-rs.git?branch=main#cbcb5a36d4194de20f6c16faf37d3d006ad12154"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -676,8 +670,7 @@ dependencies = [
 [[package]]
 name = "nexora-proto"
 version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f61efa322789e5d57fb5b05765aae2a086c889a1a0f093c6075f41fd589c278d"
+source = "git+https://github.com/trunkszi/nexora-rs.git?branch=main#cbcb5a36d4194de20f6c16faf37d3d006ad12154"
 dependencies = [
  "base64",
  "rcgen",
