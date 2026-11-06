@@ -1,0 +1,5 @@
+error: duplicate or conflicting attribute
+ --> tests/fixtures/derive/conflicting_metadata.rs:5:19
+  |
+5 |     #[record(key, timestamp)]
+  |                   ^^^^^^^^^
